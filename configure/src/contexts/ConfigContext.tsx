@@ -120,7 +120,7 @@ const initialConfig: AppConfig = {
   hideUnreleasedDigitalSearch: false,
   hideUnreleasedShows: false,
   hideUnreleasedShowsSearch: false,
-  hideWatchedTrakt: false,
+  hideWatchedTrakt: true,
   hideWatchedAnilist: false,
   hideWatchedMdblist: false,
   providers: { movie: 'tmdb', series: 'tvdb', anime: 'tvdb', anime_id_provider: 'kitsu', forceAnimeForDetectedImdb: false },
