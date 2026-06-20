@@ -1513,7 +1513,7 @@ function getDefaultCatalogs(): any[] {
     defaultTypes.map(type => ({
     id: `streaming.${id}`,
     type,
-    showInHome: type === 'series',
+    showInHome: true,
     enabled: true
   }))
   );

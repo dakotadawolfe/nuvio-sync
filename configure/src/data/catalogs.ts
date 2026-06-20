@@ -72,7 +72,7 @@ export const streamingCatalogs: StreamingCatalogDefinition[] = streamingServices
     type: 'movie',
     source: 'streaming',
     isEnabledByDefault: false,
-    showOnHomeByDefault: false,
+    showOnHomeByDefault: true,
     regions: Object.entries(regions)
       .filter(([country, ids]) => ids.includes(service.id))
       .map(([country]) => country),
