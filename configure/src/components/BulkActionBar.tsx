@@ -1,0 +1,932 @@
+import { useMemo, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { X, MoreHorizontal, Power, PowerOff, Home, HomeIcon, Trash2, Loader2, Star, Shuffle, ArrowUpToLine, ArrowDownToLine, Move, Type, GitMerge, Tag } from 'lucide-react';
+import { CatalogConfig } from '@/contexts/config';
+import { cn } from '@/lib/utils';
+import { TagEditorDialog } from '@/components/TagEditorDialog';
+
+type BulkActionType =
+  | 'enable'
+  | 'disable'
+  | 'addToHome'
+  | 'removeFromHome'
+  | 'delete'
+  | 'invert'
+  | 'enableRatingPosters'
+  | 'disableRatingPosters'
+  | 'enableRandomize'
+  | 'disableRandomize'
+  | 'moveToTop'     
+  | 'moveToBottom'   
+  | 'setDisplayType'
+  | 'merge'
+  | null;
+
+interface BulkActionBarProps {
+  selectedCatalogs: CatalogConfig[];
+  onEnableSelected: () => void;
+  onDisableSelected: () => void;
+  onAddToHome: () => void;
+  onRemoveFromHome: () => void;
+  onDeleteSelected: () => void;
+  onInvertSelection: () => void;
+  onClearSelection: () => void;
+  onMoveToTop?: () => void;   
+  onMoveToBottom?: () => void; 
+  onEnableRatingPosters?: () => void;
+  onDisableRatingPosters?: () => void;
+  onEnableRandomize?: () => void;
+  onDisableRandomize?: () => void;
+  onSetDisplayType?: (type: string) => void;
+  onResetDisplayType?: () => void;
+  onFindReplaceType?: (find: string, replace: string) => void;
+  onMergeSelected?: () => void;
+  hasRatingPostersKey?: boolean;
+  isLoading?: boolean;
+  loadingAction?: BulkActionType;
+}
+
+export function BulkActionBar({
+  selectedCatalogs,
+  onEnableSelected,
+  onDisableSelected,
+  onAddToHome,
+  onRemoveFromHome,
+  onDeleteSelected,
+  onInvertSelection,
+  onClearSelection,
+  onMoveToTop,
+  onMoveToBottom,
+  onEnableRatingPosters,
+  onDisableRatingPosters,
+  onEnableRandomize,
+  onDisableRandomize,
+  onSetDisplayType,
+  onResetDisplayType,
+  onFindReplaceType,
+  onMergeSelected,
+  hasRatingPostersKey = false,
+  isLoading = false,
+  loadingAction = null,
+}: BulkActionBarProps) {
+  const selectionCount = selectedCatalogs.length;
+
+  // Determine which actions are applicable
+  const hasDisabledCatalogs = selectedCatalogs.some(c => !c.enabled);
+  const hasEnabledCatalogs = selectedCatalogs.some(c => c.enabled);
+  const hasNotInHome = selectedCatalogs.some(c => !c.showInHome);
+  const hasInHome = selectedCatalogs.some(c => c.showInHome);
+  const hasRemovableCatalogs = selectedCatalogs.some(c => c.source !== 'merged');
+  const hasRatingPostersDisabled = selectedCatalogs.some(c => c.enableRatingPosters === false);
+  const hasRatingPostersEnabled = selectedCatalogs.some(c => c.enableRatingPosters !== false);
+  const hasRandomizeDisabled = selectedCatalogs.some(c => !c.randomizePerPage);
+  const hasRandomizeEnabled = selectedCatalogs.some(c => c.randomizePerPage);
+  
+  // Count non-removable catalogs for tooltip (merged catalogs are disbanded, not deleted)
+  const nonRemovableCount = selectedCatalogs.filter(c => c.source === 'merged').length;
+  const [showDisplayTypeDialog, setShowDisplayTypeDialog] = useState(false);
+  const [displayTypeValue, setDisplayTypeValue] = useState('');
+  const [showFindReplaceDialog, setShowFindReplaceDialog] = useState(false);
+  const [showTagDialog, setShowTagDialog] = useState(false);
+  const tagTargetKeys = useMemo(
+    () => new Set(selectedCatalogs.map(c => `${c.id}-${c.type}`)),
+    [selectedCatalogs]
+  );
+  const [findTypeValue, setFindTypeValue] = useState('');
+  const [replaceTypeValue, setReplaceTypeValue] = useState('');
+  const hasDisplayTypeOverrides = selectedCatalogs.some(c => c.displayType);
+  const findReplaceMatchCount = findTypeValue.trim()
+    ? selectedCatalogs.filter(c => (c.displayType || c.type) === findTypeValue.trim()).length
+    : 0;
+  const isMobile = typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches;
+
+  if (selectionCount === 0) {
+    return null;
+  }
+
+  const canMerge = onMergeSelected && selectionCount >= 2 && !selectedCatalogs.some(c => c.source === 'merged');
+
+  type MobileAction = {
+    id: string;
+    label: string;
+    icon: ReactNode;
+    onClick: () => void;
+    show: boolean;
+    destructive?: boolean;
+  };
+
+  const mobileActions: MobileAction[] = [
+    {
+      id: 'merge',
+      label: 'Merge',
+      icon: loadingAction === 'merge' ? <Loader2 className="h-5 w-5 animate-spin" /> : <GitMerge className="h-5 w-5 text-violet-400" />,
+      onClick: () => onMergeSelected?.(),
+      show: !!canMerge,
+    },
+    {
+      id: 'tag',
+      label: 'Tag',
+      icon: <Tag className="h-5 w-5" />,
+      onClick: () => setShowTagDialog(true),
+      show: true,
+    },
+    {
+      id: 'enable',
+      label: 'Enable',
+      icon: loadingAction === 'enable' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Power className="h-5 w-5" />,
+      onClick: onEnableSelected,
+      show: hasDisabledCatalogs,
+    },
+    {
+      id: 'disable',
+      label: 'Disable',
+      icon: loadingAction === 'disable' ? <Loader2 className="h-5 w-5 animate-spin" /> : <PowerOff className="h-5 w-5" />,
+      onClick: onDisableSelected,
+      show: hasEnabledCatalogs,
+    },
+    {
+      id: 'addToHome',
+      label: 'To Home',
+      icon: loadingAction === 'addToHome' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Home className="h-5 w-5" />,
+      onClick: onAddToHome,
+      show: hasNotInHome,
+    },
+    {
+      id: 'removeFromHome',
+      label: 'From Home',
+      icon: loadingAction === 'removeFromHome' ? <Loader2 className="h-5 w-5 animate-spin" /> : <HomeIcon className="h-5 w-5" />,
+      onClick: onRemoveFromHome,
+      show: hasInHome,
+    },
+    {
+      id: 'enableRatingPosters',
+      label: 'Ratings',
+      icon: loadingAction === 'enableRatingPosters' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Star className="h-5 w-5 text-yellow-500" />,
+      onClick: () => onEnableRatingPosters?.(),
+      show: hasRatingPostersKey && hasRatingPostersDisabled && !!onEnableRatingPosters,
+    },
+    {
+      id: 'disableRatingPosters',
+      label: 'No Ratings',
+      icon: loadingAction === 'disableRatingPosters' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Star className="h-5 w-5 text-muted-foreground" />,
+      onClick: () => onDisableRatingPosters?.(),
+      show: hasRatingPostersKey && hasRatingPostersEnabled && !!onDisableRatingPosters,
+    },
+    {
+      id: 'enableRandomize',
+      label: 'Shuffle',
+      icon: loadingAction === 'enableRandomize' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Shuffle className="h-5 w-5 text-purple-500" />,
+      onClick: () => onEnableRandomize?.(),
+      show: hasRandomizeDisabled && !!onEnableRandomize,
+    },
+    {
+      id: 'disableRandomize',
+      label: 'No Shuffle',
+      icon: loadingAction === 'disableRandomize' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Shuffle className="h-5 w-5 text-muted-foreground" />,
+      onClick: () => onDisableRandomize?.(),
+      show: hasRandomizeEnabled && !!onDisableRandomize,
+    },
+    {
+      id: 'setDisplayType',
+      label: 'Set Type',
+      icon: <Type className="h-5 w-5" />,
+      onClick: () => { setDisplayTypeValue(''); setShowDisplayTypeDialog(true); },
+      show: !!onSetDisplayType,
+    },
+    {
+      id: 'resetDisplayType',
+      label: 'Reset Type',
+      icon: <Type className="h-5 w-5 text-muted-foreground" />,
+      onClick: () => onResetDisplayType?.(),
+      show: !!onSetDisplayType && hasDisplayTypeOverrides && !!onResetDisplayType,
+    },
+    {
+      id: 'findReplaceType',
+      label: 'Find/Replace',
+      icon: <Type className="h-5 w-5" />,
+      onClick: () => { setFindTypeValue(''); setReplaceTypeValue(''); setShowFindReplaceDialog(true); },
+      show: !!onFindReplaceType,
+    },
+    {
+      id: 'invert',
+      label: 'Invert',
+      icon: loadingAction === 'invert' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Move className="h-5 w-5" />,
+      onClick: onInvertSelection,
+      show: true,
+    },
+    {
+      id: 'delete',
+      label: 'Delete',
+      icon: loadingAction === 'delete' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Trash2 className="h-5 w-5" />,
+      onClick: onDeleteSelected,
+      show: hasRemovableCatalogs,
+      destructive: true,
+    },
+  ];
+
+  const dialogs = (
+    <>
+      <TagEditorDialog
+        open={showTagDialog}
+        onOpenChange={setShowTagDialog}
+        targetKeys={tagTargetKeys}
+        title="Tag selected catalogs"
+      />
+      {onSetDisplayType && (
+        <Dialog open={showDisplayTypeDialog} onOpenChange={setShowDisplayTypeDialog}>
+          <DialogContent className="sm:max-w-[320px]">
+            <DialogHeader>
+              <DialogTitle>Set Display Type</DialogTitle>
+              <DialogDescription>
+                Override the type label for {selectionCount} selected catalog{selectionCount === 1 ? '' : 's'} (e.g. "film", "shows", "anime")
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              value={displayTypeValue}
+              onChange={(e) => setDisplayTypeValue(e.target.value)}
+              placeholder="e.g. film, shows, anime..."
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && displayTypeValue.trim()) {
+                  onSetDisplayType(displayTypeValue.trim());
+                  setDisplayTypeValue('');
+                  setShowDisplayTypeDialog(false);
+                } else if (e.key === 'Escape') {
+                  setShowDisplayTypeDialog(false);
+                }
+              }}
+            />
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={() => setShowDisplayTypeDialog(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={!displayTypeValue.trim()}
+                onClick={() => {
+                  onSetDisplayType(displayTypeValue.trim());
+                  setDisplayTypeValue('');
+                  setShowDisplayTypeDialog(false);
+                }}
+              >
+                Apply
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+      {onFindReplaceType && (
+        <Dialog open={showFindReplaceDialog} onOpenChange={setShowFindReplaceDialog}>
+          <DialogContent className="sm:max-w-[360px]">
+            <DialogHeader>
+              <DialogTitle>Find &amp; Replace Type</DialogTitle>
+              <DialogDescription>
+                Replace all instances of one type with another across {selectionCount} selected catalog{selectionCount === 1 ? '' : 's'}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <label className="text-sm font-medium">Find</label>
+                <Input
+                  value={findTypeValue}
+                  onChange={(e) => setFindTypeValue(e.target.value)}
+                  placeholder="Current type (e.g. movie)"
+                  autoFocus
+                />
+                {findTypeValue.trim() && (
+                  <p className="text-xs text-muted-foreground">
+                    {findReplaceMatchCount} catalog{findReplaceMatchCount === 1 ? '' : 's'} match{findReplaceMatchCount === 1 ? 'es' : ''}
+                  </p>
+                )}
+              </div>
+              <div className="space-y-1">
+                <label className="text-sm font-medium">Replace with</label>
+                <Input
+                  value={replaceTypeValue}
+                  onChange={(e) => setReplaceTypeValue(e.target.value)}
+                  placeholder="New type (e.g. film)"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && findTypeValue.trim() && replaceTypeValue.trim() && findReplaceMatchCount > 0) {
+                      onFindReplaceType(findTypeValue.trim(), replaceTypeValue.trim());
+                      setShowFindReplaceDialog(false);
+                    }
+                  }}
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={() => setShowFindReplaceDialog(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={!findTypeValue.trim() || !replaceTypeValue.trim() || findReplaceMatchCount === 0}
+                onClick={() => {
+                  onFindReplaceType(findTypeValue.trim(), replaceTypeValue.trim());
+                  setShowFindReplaceDialog(false);
+                }}
+              >
+                Replace {findReplaceMatchCount > 0 ? `(${findReplaceMatchCount})` : ''}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+    </>
+  );
+
+  const mobileBar = (
+    <div
+      className="fixed bottom-0 left-0 right-0 z-50 bg-background/95 backdrop-blur border-t px-3 py-2 pb-safe shadow-[0_-2px_10px_rgba(0,0,0,0.1)] animate-slide-up"
+      role="region"
+      aria-label="Bulk actions"
+      aria-live="polite"
+      aria-busy={isLoading}
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm font-medium">
+          {selectionCount} {selectionCount === 1 ? 'item' : 'items'} selected
+        </span>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={onClearSelection}
+          disabled={isLoading}
+          aria-label="Clear selection"
+          className="h-8 px-2 text-muted-foreground"
+        >
+          <X className="h-4 w-4" />
+          <span className="ml-1">Clear</span>
+        </Button>
+      </div>
+      <div className="flex items-stretch gap-2 overflow-x-auto -mx-3 px-3 pb-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+        {mobileActions.filter(a => a.show).map(a => (
+          <button
+            key={a.id}
+            type="button"
+            onClick={a.onClick}
+            disabled={isLoading}
+            aria-label={a.label}
+            className={cn(
+              "flex shrink-0 flex-col items-center justify-center gap-1 rounded-xl border px-3 py-2 min-w-[68px] transition-colors active:bg-accent/60 disabled:opacity-50",
+              a.destructive
+                ? "border-destructive/40 text-destructive bg-destructive/5"
+                : "border-white/[0.08] bg-card/60 text-foreground"
+            )}
+          >
+            {a.icon}
+            <span className="text-[10px] font-medium leading-none whitespace-nowrap">{a.label}</span>
+          </button>
+        ))}
+      </div>
+      {dialogs}
+    </div>
+  );
+
+  const bar = (
+    <div
+      className="z-50 bg-background px-4 py-3 pb-safe sticky top-0 border-b shadow-[0_2px_10px_rgba(0,0,0,0.1)] animate-slide-down"
+      role="region"
+      aria-label="Bulk actions"
+      aria-live="polite"
+      aria-busy={isLoading}
+    >
+      <div className="flex flex-col gap-3">
+        {/* Selection counter and clear button */}
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium animate-fade-in">
+            {selectionCount} {selectionCount === 1 ? 'item' : 'items'} selected
+          </span>
+          {/* Clear Selection - always visible on mobile */}
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={onClearSelection}
+            disabled={isLoading}
+            aria-label="Clear selection"
+            className="md:hidden"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+
+        {/* Action buttons */}
+        <TooltipProvider>
+          <div className="flex flex-col md:flex-row md:flex-wrap items-stretch md:items-center gap-2">
+
+            {/* Move Grouping */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button 
+                  size="sm" 
+                  variant="outline" 
+                  onClick={onMoveToTop} 
+                  disabled={isLoading}
+                  className="hidden sm:flex border-blue-200 dark:border-blue-800"
+                >
+                  <ArrowUpToLine className="h-4 w-4 text-blue-500" />
+                  <span className="ml-2">To Top</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Move selection to start of list</TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button 
+                  size="sm" 
+                  variant="outline" 
+                  onClick={onMoveToBottom} 
+                  disabled={isLoading}
+                  className="hidden sm:flex border-blue-200 dark:border-blue-800"
+                >
+                  <ArrowDownToLine className="h-4 w-4 text-blue-500" />
+                  <span className="ml-2">To Bottom</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Move selection to end of list</TooltipContent>
+            </Tooltip>
+
+            {/* Merge Selected */}
+            {canMerge && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onMergeSelected}
+                    disabled={isLoading}
+                    aria-label="Merge selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0 border-violet-300 dark:border-violet-700"
+                  >
+                    {loadingAction === 'merge' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <GitMerge className="h-4 w-4 text-violet-400" />
+                    )}
+                    <span className="ml-2">Merge</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Merge selected catalogs into one</TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Tag Selected */}
+            {selectionCount > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setShowTagDialog(true)}
+                    disabled={isLoading}
+                    aria-label="Tag selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    <Tag className="h-4 w-4" />
+                    <span className="ml-2">Tag</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Apply or remove tags</TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Enable Selected */}
+            {hasDisabledCatalogs && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onEnableSelected}
+                    disabled={isLoading}
+                    aria-label="Enable selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'enable' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Power className="h-4 w-4" />
+                    )}
+                    <span className="ml-2">Enable Selected</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Enable all selected disabled catalogs</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Disable Selected */}
+            {hasEnabledCatalogs && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onDisableSelected}
+                    disabled={isLoading}
+                    aria-label="Disable selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'disable' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <PowerOff className="h-4 w-4" />
+                    )}
+                    <span className="ml-2">Disable Selected</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Disable all selected enabled catalogs</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Add to Home */}
+            {hasNotInHome && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onAddToHome}
+                    disabled={isLoading}
+                    aria-label="Add selected catalogs to home"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'addToHome' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Home className="h-4 w-4" />
+                    )}
+                    <span className="ml-2">Add to Home</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Add selected enabled catalogs to home board</p>
+                  {selectedCatalogs.some(c => !c.enabled) && (
+                    <p className="text-xs text-muted-foreground mt-1">
+                      (Disabled catalogs will be skipped)
+                    </p>
+                  )}
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Remove from Home */}
+            {hasInHome && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onRemoveFromHome}
+                    disabled={isLoading}
+                    aria-label="Remove selected catalogs from home"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'removeFromHome' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <HomeIcon className="h-4 w-4" />
+                    )}
+                    <span className="ml-2">Remove from Home</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Remove selected catalogs from home board</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Enable RPDB for Selected */}
+            {hasRatingPostersKey && hasRatingPostersDisabled && onEnableRatingPosters && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onEnableRatingPosters}
+                    disabled={isLoading}
+                    aria-label="Enable Rating Posters for selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'enableRatingPosters' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Star className="h-4 w-4 text-yellow-500" />
+                    )}
+                    <span className="ml-2">Enable Rating Posters</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Enable Rating Posters for selected catalogs</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Enable Randomize */}
+            {hasRandomizeDisabled && onEnableRandomize && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onEnableRandomize}
+                    disabled={isLoading}
+                    aria-label="Enable random order for selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'enableRandomize' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Shuffle className="h-4 w-4 text-purple-500" />
+                    )}
+                    <span className="ml-2">Enable Randomize</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Randomize items within each page for selected catalogs</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Disable Randomize */}
+            {hasRandomizeEnabled && onDisableRandomize && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onDisableRandomize}
+                    disabled={isLoading}
+                    aria-label="Disable random order for selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'disableRandomize' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Shuffle className="h-4 w-4 text-muted-foreground" />
+                    )}
+                    <span className="ml-2">Disable Randomize</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Restore original ordering for selected catalogs</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Disable RPDB for Selected */}
+            {hasRatingPostersKey && hasRatingPostersEnabled && onDisableRatingPosters && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onDisableRatingPosters}
+                    disabled={isLoading}
+                    aria-label="Disable Rating Posters for selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'disableRatingPosters' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Star className="h-4 w-4 text-muted-foreground" />
+                    )}
+                    <span className="ml-2">Disable Rating Posters</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Disable Rating Posters for selected catalogs</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* Delete Selected */}
+            {hasRemovableCatalogs && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={onDeleteSelected}
+                    disabled={isLoading}
+                    aria-label="Delete selected catalogs"
+                    className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                  >
+                    {loadingAction === 'delete' ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-4 w-4" />
+                    )}
+                    <span className="ml-2">Delete Selected</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Delete selected removable catalogs</p>
+                  {nonRemovableCount > 0 && (
+                    <p className="text-xs text-muted-foreground mt-1">
+                      ({nonRemovableCount} non-removable catalog{nonRemovableCount === 1 ? '' : 's'} will be skipped)
+                    </p>
+                  )}
+                </TooltipContent>
+              </Tooltip>
+            )}
+
+            {/* More dropdown */}
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={isLoading}
+                  aria-label="More actions"
+                  className="w-full md:w-auto justify-start md:justify-center min-h-[44px] md:min-h-0"
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                  <span className="ml-2">More</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" onCloseAutoFocus={(e) => e.preventDefault()}>
+                {onSetDisplayType && (
+                  <>
+                    <DropdownMenuItem onClick={() => { setDisplayTypeValue(''); setShowDisplayTypeDialog(true); }} disabled={isLoading}>
+                      <Type className="h-4 w-4 mr-2" />
+                      Set Display Type
+                    </DropdownMenuItem>
+                    {hasDisplayTypeOverrides && onResetDisplayType && (
+                      <DropdownMenuItem onClick={onResetDisplayType} disabled={isLoading}>
+                        <Type className="h-4 w-4 mr-2 text-muted-foreground" />
+                        Reset Display Type
+                      </DropdownMenuItem>
+                    )}
+                    {onFindReplaceType && (
+                      <DropdownMenuItem onClick={() => { setFindTypeValue(''); setReplaceTypeValue(''); setShowFindReplaceDialog(true); }} disabled={isLoading}>
+                        <Type className="h-4 w-4 mr-2" />
+                        Find &amp; Replace Type
+                      </DropdownMenuItem>
+                    )}
+                    <DropdownMenuSeparator />
+                  </>
+                )}
+                <DropdownMenuItem onClick={onInvertSelection} disabled={isLoading}>
+                  {loadingAction === 'invert' && <Loader2 className="h-4 w-4 animate-spin mr-2" />}
+                  Invert Selection
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {onSetDisplayType && (
+              <Dialog open={showDisplayTypeDialog} onOpenChange={setShowDisplayTypeDialog}>
+                <DialogContent className="sm:max-w-[320px]">
+                  <DialogHeader>
+                    <DialogTitle>Set Display Type</DialogTitle>
+                    <DialogDescription>
+                      Override the type label for {selectionCount} selected catalog{selectionCount === 1 ? '' : 's'} (e.g. "film", "shows", "anime")
+                    </DialogDescription>
+                  </DialogHeader>
+                  <Input
+                    value={displayTypeValue}
+                    onChange={(e) => setDisplayTypeValue(e.target.value)}
+                    placeholder="e.g. film, shows, anime..."
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && displayTypeValue.trim()) {
+                        onSetDisplayType(displayTypeValue.trim());
+                        setDisplayTypeValue('');
+                        setShowDisplayTypeDialog(false);
+                      } else if (e.key === 'Escape') {
+                        setShowDisplayTypeDialog(false);
+                      }
+                    }}
+                  />
+                  <div className="flex justify-end gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setShowDisplayTypeDialog(false)}>
+                      Cancel
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={!displayTypeValue.trim()}
+                      onClick={() => {
+                        onSetDisplayType(displayTypeValue.trim());
+                        setDisplayTypeValue('');
+                        setShowDisplayTypeDialog(false);
+                      }}
+                    >
+                      Apply
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
+            )}
+            {onFindReplaceType && (
+              <Dialog open={showFindReplaceDialog} onOpenChange={setShowFindReplaceDialog}>
+                <DialogContent className="sm:max-w-[360px]">
+                  <DialogHeader>
+                    <DialogTitle>Find &amp; Replace Type</DialogTitle>
+                    <DialogDescription>
+                      Replace all instances of one type with another across {selectionCount} selected catalog{selectionCount === 1 ? '' : 's'}
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-3">
+                    <div className="space-y-1">
+                      <label className="text-sm font-medium">Find</label>
+                      <Input
+                        value={findTypeValue}
+                        onChange={(e) => setFindTypeValue(e.target.value)}
+                        placeholder="Current type (e.g. movie)"
+                        autoFocus
+                      />
+                      {findTypeValue.trim() && (
+                        <p className="text-xs text-muted-foreground">
+                          {findReplaceMatchCount} catalog{findReplaceMatchCount === 1 ? '' : 's'} match{findReplaceMatchCount === 1 ? 'es' : ''}
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-sm font-medium">Replace with</label>
+                      <Input
+                        value={replaceTypeValue}
+                        onChange={(e) => setReplaceTypeValue(e.target.value)}
+                        placeholder="New type (e.g. film)"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && findTypeValue.trim() && replaceTypeValue.trim() && findReplaceMatchCount > 0) {
+                            onFindReplaceType(findTypeValue.trim(), replaceTypeValue.trim());
+                            setShowFindReplaceDialog(false);
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setShowFindReplaceDialog(false)}>
+                      Cancel
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={!findTypeValue.trim() || !replaceTypeValue.trim() || findReplaceMatchCount === 0}
+                      onClick={() => {
+                        onFindReplaceType(findTypeValue.trim(), replaceTypeValue.trim());
+                        setShowFindReplaceDialog(false);
+                      }}
+                    >
+                      Replace {findReplaceMatchCount > 0 ? `(${findReplaceMatchCount})` : ''}
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
+            )}
+            {}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={onClearSelection}
+                  disabled={isLoading}
+                  aria-label="Clear selection"
+                  className="hidden md:inline-flex"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>Clear selection</p>
+              </TooltipContent>
+            </Tooltip>
+          </div>
+        </TooltipProvider>
+      </div>
+
+      <TagEditorDialog
+        open={showTagDialog}
+        onOpenChange={setShowTagDialog}
+        targetKeys={tagTargetKeys}
+        title="Tag selected catalogs"
+      />
+    </div>
+  );
+
+  if (isMobile && typeof document !== 'undefined') {
+    return createPortal(mobileBar, document.body);
+  }
+  return bar;
+}

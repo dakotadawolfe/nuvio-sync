@@ -1,0 +1,742 @@
+import { lazy, Suspense, useState, useEffect, useMemo, type KeyboardEvent } from "react";
+import { useConfig } from "@/contexts/ConfigContext";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Skeleton } from "@/components/ui/skeleton";
+import { AlertCircle, AlertTriangle, CheckCircle, Copy, Loader2, Save, Key, User, Download, Eye, EyeOff } from "lucide-react";
+import { toast } from "sonner";
+import { TagChip } from "@/components/TagChip";
+import { cn } from "@/lib/utils";
+
+interface ConfigurationManagerProps {
+  children?: React.ReactNode;
+}
+
+interface SavedConfig {
+  userUUID: string;
+  installUrl: string;
+}
+
+const LazyInstallDialog = lazy(() =>
+  import("@/components/InstallDialog").then((module) => ({ default: module.InstallDialog }))
+);
+const LazyConfigImportExport = lazy(() =>
+  import("@/components/ConfigImportExport").then((module) => ({ default: module.ConfigImportExport }))
+);
+
+const apiKeyStatusFields = [
+  { key: 'tmdb', name: 'TMDB', required: true },
+  { key: 'tvdb', name: 'TheTVDB', required: true },
+  { key: 'rpdb', name: 'RPDB', required: true },
+  { key: 'traktTokenId', name: 'Trakt', required: true },
+  { key: 'emby', name: 'Emby', required: true },
+] as const;
+
+type IntegrationStatusKey = typeof apiKeyStatusFields[number]['key'];
+
+function ConfigurationSectionFallback() {
+  return (
+    <div className="space-y-3 rounded-lg border bg-muted/20 p-5">
+      <div className="text-sm font-medium text-muted-foreground">Loading configuration tools...</div>
+      <Skeleton className="h-4 w-40" />
+      <Skeleton className="h-24 w-full" />
+      <Skeleton className="h-24 w-full" />
+    </div>
+  );
+}
+
+export function ConfigurationManager({ children }: ConfigurationManagerProps) {
+  const { config, auth, setAuth, hasBuiltInTvdb, hasBuiltInTmdb, isLoading: contextLoading, manifestChangedSinceInstall, markManifestInstalled } = useConfig();
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [savedConfig, setSavedConfig] = useState<SavedConfig | null>(null);
+  const [showPasswordDialog, setShowPasswordDialog] = useState(false);
+  const [isInstallOpen, setIsInstallOpen] = useState(false);
+  const [installUrl, setInstallUrl] = useState("");
+  const [selectedTag, setSelectedTag] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [addonPassword, setAddonPassword] = useState("");
+  const [requireAddonPassword, setRequireAddonPassword] = useState(false);
+  const [showLoadDialog, setShowLoadDialog] = useState(false);
+  const [loadPassword, setLoadPassword] = useState("");
+  const [loadAddonPassword, setLoadAddonPassword] = useState("");
+  const [loadError, setLoadError] = useState("");
+  const [isLoadingLoad, setIsLoadingLoad] = useState(false);
+  const [isUUIDTrusted, setIsUUIDTrusted] = useState<boolean | null>(null);
+  const [showReinstallWarning, setShowReinstallWarning] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/config/addon-info")
+      .then(res => res.json())
+      .then(data => setRequireAddonPassword(!!data.requiresAddonPassword))
+      .catch(() => setRequireAddonPassword(false));
+  }, []);
+
+  // Auto-load config if userUUID is in URL but not authenticated
+  useEffect(() => {
+    if (auth.userUUID && !auth.authenticated) {
+      // Show password dialog to load config
+      setShowPasswordDialog(true);
+    }
+  }, [auth.userUUID, auth.authenticated]);
+
+  useEffect(() => {
+    if (savedConfig?.userUUID && savedConfig.userUUID.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+      fetch(`/api/config/is-trusted/${encodeURIComponent(savedConfig.userUUID)}`)
+        .then(res => res.json())
+        .then(data => {
+          setIsUUIDTrusted(!!data.trusted);
+          setRequireAddonPassword(!!data.requiresAddonPassword);
+        })
+        .catch(() => {
+          setIsUUIDTrusted(null);
+          setRequireAddonPassword(false);
+        });
+    } else {
+      setIsUUIDTrusted(null);
+      setRequireAddonPassword(false);
+    }
+  }, [savedConfig?.userUUID]);
+
+  const isIntegrationConfigured = (key: IntegrationStatusKey) => {
+    if (key === 'tmdb') {
+      const hasUserKey = config.apiKeys.tmdb?.trim();
+      return !!(hasUserKey || hasBuiltInTmdb);
+    }
+    if (key === 'tvdb') {
+      const hasUserKey = config.apiKeys.tvdb?.trim();
+      return !!(hasUserKey || hasBuiltInTvdb);
+    }
+    if (key === 'emby') {
+      return !!(
+        config.apiKeys?.embyServer?.trim() &&
+        config.apiKeys?.embyUserId?.trim() &&
+        config.apiKeys?.embyAccessToken?.trim()
+      );
+    }
+    return !!config.apiKeys?.[key]?.trim();
+  };
+
+  const validateRequiredKeys = () => {
+    // Don't validate until context is loaded
+    if (contextLoading) {
+      return { valid: true };
+    }
+    
+    
+    const requiredKeys = apiKeyStatusFields
+      .filter(field => field.required)
+      .map(field => field.key);
+
+    const missingKeys = requiredKeys.filter(key => !isIntegrationConfigured(key));
+    if (missingKeys.length > 0) {
+      const displayNameForKey = (key: typeof missingKeys[number]) =>
+        apiKeyStatusFields.find(field => field.key === key)?.name || key.toUpperCase();
+
+      return {
+        valid: false,
+        missingKeys,
+        message: `Missing required integrations: ${missingKeys.map(displayNameForKey).join(', ')}`
+      };
+    }
+    return { valid: true };
+  };
+
+  const handleSaveConfiguration = async () => {
+    setIsLoading(true);
+    setError("");
+    const validation = validateRequiredKeys();
+    if (!validation.valid) {
+      setError(validation.message);
+      setIsLoading(false);
+      return;
+    }
+    const isAuthenticated = auth.authenticated && auth.userUUID && auth.password;
+    try {
+      const apiKeysWithoutLegacy = { ...config.apiKeys } as Record<string, unknown>;
+      delete apiKeysWithoutLegacy.embyUsername;
+      delete apiKeysWithoutLegacy.embyPassword;
+
+      // Remove instance-specific fields that shouldn't be saved to user config
+      const configToSave = {
+        ...config,
+        catalogModeOnly: false,
+        apiKeys: {
+          ...apiKeysWithoutLegacy,
+          customDescriptionBlurb: undefined // Never save this - it's instance-specific
+        }
+      };
+      
+      const response = isAuthenticated
+        ? await fetch(`/api/config/update/${encodeURIComponent(auth.userUUID!)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config: configToSave, password: auth.password, addonPassword })
+          })
+        : await fetch('/api/config/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config: configToSave, password, addonPassword })
+          });
+      if (!response.ok) {
+        let message = 'Failed to save configuration';
+        try {
+          const errorData = await response.json();
+          message = errorData?.error || message;
+        } catch (_) {
+          const text = await response.text();
+          if (text) message = text;
+        }
+        throw new Error(message);
+      }
+      let result: any;
+      try {
+        result = await response.json();
+      } catch (_) {
+        const text = await response.text();
+        throw new Error(text || 'Invalid JSON response from server');
+      }
+      setSavedConfig(result);
+      setSelectedTag('');
+      if (!isAuthenticated && result?.userUUID) {
+        setAuth({ authenticated: true, userUUID: result.userUUID, password });
+      }
+      setShowPasswordDialog(false);
+      setPassword("");
+      setConfirmPassword("");
+      setAddonPassword("");
+      setShowReinstallWarning(manifestChangedSinceInstall());
+      toast.success("Configuration saved successfully!");
+    } catch (err) {
+      console.error('Save configuration error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to save configuration');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const copyToClipboard = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(`${label} copied to clipboard!`);
+    } catch (err) {
+      console.error('Copy failed:', err);
+      toast.error('Failed to copy to clipboard');
+    }
+  };
+
+  const handleLoadConfiguration = async () => {
+    if (!savedConfig?.userUUID) return;
+    setIsLoadingLoad(true);
+    setLoadError("");
+    try {
+      const response = await fetch(`/api/config/load/${savedConfig.userUUID}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: loadPassword, addonPassword: loadAddonPassword })
+      });
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to load configuration');
+      }
+      const result = await response.json();
+      toast.success("Configuration loaded successfully!");
+      setShowLoadDialog(false);
+      setLoadPassword("");
+      setLoadAddonPassword("");
+      setLoadError("");
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : 'Failed to load configuration');
+    } finally {
+      setIsLoadingLoad(false);
+    }
+  };
+
+  const handleLoadFromUrl = async () => {
+    if (!auth.userUUID) return;
+    setIsLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/config/load/${auth.userUUID}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      const success = response.ok;
+      if (success) {
+        setAuth({ authenticated: true, userUUID: auth.userUUID, password });
+        setShowPasswordDialog(false);
+        setPassword("");
+        setAddonPassword("");
+        toast.success("Configuration loaded successfully!");
+      } else {
+        setError("Invalid password or configuration not found");
+      }
+    } catch (err) {
+      console.error('Load from URL error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to load configuration');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const canSubmitPasswordDialog = auth.userUUID
+    ? password.length >= 6
+    : password.length >= 6 && password === confirmPassword;
+
+  const submitPasswordDialog = () => {
+    if (isLoading || !canSubmitPasswordDialog) return;
+    if (auth.userUUID) {
+      void handleLoadFromUrl();
+      return;
+    }
+    void handleSaveConfiguration();
+  };
+
+  const handlePasswordDialogKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    submitPasswordDialog();
+  };
+
+  const validation = useMemo(() => validateRequiredKeys(), [config, hasBuiltInTmdb, hasBuiltInTvdb, contextLoading]);
+
+  const profileTags = config.tags ?? [];
+  const taggedInstallUrl = savedConfig
+    ? (selectedTag ? `${savedConfig.installUrl}?tag=${encodeURIComponent(selectedTag)}` : savedConfig.installUrl)
+    : "";
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Key className="h-5 w-5" />
+            Configuration Status
+          </CardTitle>
+          <CardDescription>
+            Review required integrations and save your addon setup
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <Label>Integration Status</Label>
+            <div className="space-y-2">
+              {apiKeyStatusFields.map(({ key, name, required }) => {
+                const isConfigured = isIntegrationConfigured(key);
+                
+                return (
+                  <div key={key} className="flex items-center justify-between py-2 border-b border-gray-200 last:border-b-0">
+                    <div className="flex items-center gap-3">
+                      {isConfigured ? (
+                        <CheckCircle className="h-4 w-4 text-green-500" />
+                      ) : (
+                        <AlertCircle className="h-4 w-4 text-red-500" />
+                      )}
+                      <div>
+                        <span className="text-sm font-medium">{name}</span>
+                        <span className="text-xs text-gray-500 ml-2">
+                          {required ? 'Required' : 'Optional'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="text-sm">
+                      {isConfigured ? (
+                        <span className="text-green-600 font-medium">Configured</span>
+                      ) : (
+                        <span className="text-red-600 font-medium">Missing</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            {!validation.valid && (
+              <p className="text-sm text-red-600">
+                Please configure all required integrations before saving
+              </p>
+            )}
+            {error && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="h-4 w-4 text-red-500" />
+                  <span className="text-sm text-red-700">{error}</span>
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-end">
+              <Dialog open={!auth.authenticated && showPasswordDialog} onOpenChange={setShowPasswordDialog}>
+              <Button
+                disabled={!validation.valid || isLoading}
+                className="flex items-center gap-2"
+                onClick={() => {
+                  if (!validation.valid || isLoading) return;
+                  
+                  setError("");
+                  
+                  // Check if TVDB is being used anywhere
+                  const isTvdbInProviders = 
+                    config.providers?.movie === 'tvdb' ||
+                    config.providers?.series === 'tvdb' ||
+                    config.providers?.anime === 'tvdb';
+                  
+                  const isTvdbInArt = ['movie', 'series', 'anime'].some(contentType => {
+                    const provider = config.artProviders?.[contentType];
+                    if (typeof provider === 'string') {
+                      return provider === 'tvdb';
+                    }
+                    if (typeof provider === 'object' && provider !== null) {
+                      return provider.poster === 'tvdb' || 
+                             provider.background === 'tvdb' || 
+                             provider.logo === 'tvdb';
+                    }
+                    return false;
+                  });
+                  
+                  // Only validate TVDB key if TVDB is actually being used
+                  if (isTvdbInProviders || isTvdbInArt) {
+                    const hasTvdbKey = !!config.apiKeys?.tvdb?.trim() || hasBuiltInTvdb;
+                    if (!hasTvdbKey) {
+                      setError("TVDB is selected as a provider but no TVDB API key is configured. Please add your TVDB API key in the Integrations tab or choose a different provider.");
+                      return;
+                    }
+                  }
+                  
+                  if (auth.authenticated) {
+                    void handleSaveConfiguration();
+                  } else {
+                    setShowPasswordDialog(true);
+                  }
+                }}
+              >
+                {isLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                Save Configuration
+              </Button>
+              <DialogContent>
+                <DialogHeader>
+                   <DialogTitle>{auth.userUUID ? 'Load Configuration' : 'Create Password'}</DialogTitle>
+                  <DialogDescription>
+                    {auth.userUUID 
+                      ? 'Enter your password to load your existing configuration.'
+                      : 'Create a password to protect your configuration. You\'ll need this password to access your configuration later.'
+                    }
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4">
+                  {error && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                      <div className="flex items-center gap-2">
+                        <AlertCircle className="h-4 w-4 text-red-500" />
+                        <span className="text-sm text-red-700">{error}</span>
+                      </div>
+                    </div>
+                  )}
+                   <div className="space-y-2">
+                    <Label htmlFor="password">Password</Label>
+                    <div className="relative">
+                      <Input
+                        id="password"
+                        type={showPassword ? "text" : "password"}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        onKeyDown={handlePasswordDialogKeyDown}
+                        placeholder="Enter your password"
+                        minLength={6}
+                      />
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="absolute right-2 top-1/2 -translate-y-1/2"
+                        onClick={() => setShowPassword(!showPassword)}
+                      >
+                        {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">Password must be at least 6 characters long.</p>
+                  </div>
+                   {!auth.userUUID && (
+                     <div className="space-y-2">
+                       <Label htmlFor="confirmPassword">Confirm Password</Label>
+                       <div className="relative">
+                         <Input
+                           id="confirmPassword"
+                           type={showConfirmPassword ? "text" : "password"}
+                           value={confirmPassword}
+                           onChange={(e) => setConfirmPassword(e.target.value)}
+                           onKeyDown={handlePasswordDialogKeyDown}
+                           placeholder="Confirm your password"
+                           minLength={6}
+                         />
+                         <Button
+                           variant="ghost"
+                           size="sm"
+                           className="absolute right-2 top-1/2 -translate-y-1/2"
+                           onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                         >
+                           {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                         </Button>
+                       </div>
+                       <p className="text-xs text-muted-foreground mt-1">Must match the password above and be at least 6 characters.</p>
+                     </div>
+                   )}
+                  {requireAddonPassword && (
+                    <div className="space-y-2">
+                      <Label htmlFor="addonPassword">Addon Password</Label>
+                      <Input
+                        id="addonPassword"
+                        type="password"
+                        value={addonPassword}
+                        onChange={e => setAddonPassword(e.target.value)}
+                        onKeyDown={handlePasswordDialogKeyDown}
+                        placeholder="Enter the addon password"
+                        minLength={6}
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">Required by the addon administrator.</p>
+                    </div>
+                  )}
+                  <div className="flex justify-end gap-2">
+                    <Button 
+                      variant="outline" 
+                      onClick={() => setShowPasswordDialog(false)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button 
+                      onClick={submitPasswordDialog}
+                      disabled={isLoading || !canSubmitPasswordDialog}
+                    >
+                      {isLoading ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          {auth.userUUID ? 'Loading...' : 'Saving...'}
+                        </>
+                      ) : (
+                        auth.userUUID ? 'Load Configuration' : 'Save Configuration'
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              </DialogContent>
+            </Dialog>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+      {savedConfig && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <User className="h-5 w-5" />
+              Your Configuration
+            </CardTitle>
+            <CardDescription>
+              Save these credentials to access your configuration later
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-3">
+              <div>
+                <Label className="text-sm font-medium">Your UUID</Label>
+                <div className="flex items-center gap-2 mt-1">
+                  <Input 
+                    value={savedConfig.userUUID} 
+                    readOnly 
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => copyToClipboard(savedConfig.userUUID, 'UUID')}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+              <div>
+                <Label className="text-sm font-medium">Install URL</Label>
+                {profileTags.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                    <span className="text-xs text-muted-foreground mr-1">Profile:</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTag('')}
+                      className={cn(
+                        'rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors',
+                        selectedTag === ''
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-muted-foreground/30 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      All catalogs
+                    </button>
+                    {profileTags.map((t) => (
+                      <TagChip
+                        key={t.name}
+                        name={t.name}
+                        color={t.color}
+                        onClick={() => setSelectedTag(t.name)}
+                        dimmed={selectedTag !== '' && selectedTag !== t.name}
+                      />
+                    ))}
+                  </div>
+                )}
+                <div className="flex items-center gap-2 mt-1">
+                  <Input
+                    value={taggedInstallUrl}
+                    readOnly
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => { markManifestInstalled(); setShowReinstallWarning(false); copyToClipboard(taggedInstallUrl, 'Install URL'); }}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+                {selectedTag !== '' && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Installs only catalogs tagged <span className="font-medium">{selectedTag}</span> as a separate addon profile.
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="h-4 w-4 text-blue-500 mt-0.5" />
+                <span className="text-sm text-blue-700">
+                  <strong>Important:</strong> Save your UUID and password. You'll need both to access your configuration later.
+                </span>
+              </div>
+            </div>
+            {showReinstallWarning && (
+              <div className="p-3 bg-yellow-50 border border-yellow-300 rounded-md">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="h-4 w-4 text-yellow-600 mt-0.5 shrink-0" />
+                    <span className="text-sm text-yellow-800">
+                      <strong>Reinstall Required:</strong> Your configuration was saved, but the changes you made affect the addon manifest (catalogs, search, or resources). Stremio does not auto-reload manifests, so you need to reinstall the addon for these changes to take effect.
+                    </span>
+                  </div>
+                  <Button variant="ghost" size="sm" className="shrink-0 text-yellow-700 hover:text-yellow-900 hover:bg-yellow-100 -mt-1 -mr-1" onClick={() => setShowReinstallWarning(false)}>
+                    Dismiss
+                  </Button>
+                </div>
+              </div>
+            )}
+            <div className="flex gap-2">
+              <Dialog open={showLoadDialog} onOpenChange={setShowLoadDialog}>
+                <Button
+                  variant="outline"
+                  onClick={() => setShowLoadDialog(true)}
+                  disabled={isLoading}
+                >
+                  Load Configuration
+                </Button>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Load Configuration</DialogTitle>
+                    <DialogDescription>
+                      Enter your password{requireAddonPassword && isUUIDTrusted === false ? ' and addon password' : ''} to load your configuration.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-4">
+                    {loadError && (
+                      <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                        <div className="flex items-center gap-2">
+                          <AlertCircle className="h-4 w-4 text-red-500" />
+                          <span className="text-sm text-red-700">{loadError}</span>
+                        </div>
+                      </div>
+                    )}
+                    <div className="space-y-2">
+                      <Label htmlFor="loadPassword">Password</Label>
+                      <Input
+                        id="loadPassword"
+                        type="password"
+                        value={loadPassword}
+                        onChange={e => setLoadPassword(e.target.value)}
+                        placeholder="Enter your password"
+                        minLength={6}
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">Password must be at least 6 characters long.</p>
+                    </div>
+                    {requireAddonPassword && isUUIDTrusted === false && (
+                      <div className="space-y-2">
+                        <Label htmlFor="loadAddonPassword">Addon Password</Label>
+                        <Input
+                          id="loadAddonPassword"
+                          type="password"
+                          value={loadAddonPassword}
+                          onChange={e => setLoadAddonPassword(e.target.value)}
+                          placeholder="Enter the addon password"
+                          minLength={6}
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">Required by the addon administrator.</p>
+                      </div>
+                    )}
+                    <div className="flex justify-end gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => {
+                          setShowLoadDialog(false);
+                          setLoadPassword("");
+                          setLoadAddonPassword("");
+                          setLoadError("");
+                        }}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        onClick={handleLoadConfiguration}
+                        disabled={isLoadingLoad || loadPassword.length < 6}
+                      >
+                        {isLoadingLoad ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            Loading...
+                          </>
+                        ) : (
+                          'Load Configuration'
+                        )}
+                      </Button>
+                    </div>
+                  </div>
+                </DialogContent>
+              </Dialog>
+              <Button onClick={() => { markManifestInstalled(); setShowReinstallWarning(false); setInstallUrl(taggedInstallUrl); setIsInstallOpen(true); }}>
+                <Download className="h-4 w-4 mr-2" /> Install
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+      
+      {/* Danger Zone */}
+      <Suspense fallback={<ConfigurationSectionFallback />}>
+        <LazyConfigImportExport />
+      </Suspense>
+      
+      {children}
+      {isInstallOpen ? (
+        <Suspense fallback={null}>
+          <LazyInstallDialog isOpen={isInstallOpen} onClose={() => setIsInstallOpen(false)} manifestUrl={installUrl} />
+        </Suspense>
+      ) : null}
+    </div>
+  );
+}

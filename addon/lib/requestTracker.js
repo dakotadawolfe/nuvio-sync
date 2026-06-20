@@ -1,0 +1,1634 @@
+const redis = require("./redisClient");
+const consola = require("consola");
+const { isMetricsDisabled } = require('./metricsConfig');
+
+const logger = consola.withTag("Request-Tracker");
+
+function dateKeysForRange(days, tz) {
+  const dates = new Set();
+  for (let i = 0; i < days; i++) {
+    const d = new Date(Date.now() - i * 86400000);
+    dates.add(d.toISOString().split("T")[0]);
+    if (tz) {
+      try { dates.add(d.toLocaleDateString('en-CA', { timeZone: tz })); } catch {}
+    }
+  }
+  return Array.from(dates);
+}
+
+function todayKey(tz) {
+  if (tz) {
+    try { return new Date().toLocaleDateString('en-CA', { timeZone: tz }); } catch {}
+  }
+  return new Date().toISOString().split("T")[0];
+}
+
+function yesterdayKey(tz) {
+  const d = new Date(Date.now() - 86400000);
+  if (tz) {
+    try { return d.toLocaleDateString('en-CA', { timeZone: tz }); } catch {}
+  }
+  return d.toISOString().split("T")[0];
+}
+
+class RequestTracker {
+  constructor() {
+    this.startTime = Date.now();
+    this.dailyKey = `requests:${new Date().toISOString().split("T")[0]}`;
+    this.hourlyKey = `requests:${new Date().toISOString().substring(0, 13)}`;
+    this.errorKey = `errors:${new Date().toISOString().split("T")[0]}`;
+
+    // Clean up any corrupted keys on startup
+    this.cleanupCorruptedKeys().catch((error) => {
+      logger.warn(
+        "[Request Tracker] Failed to cleanup on startup:",
+        error.message,
+      );
+    });
+  }
+
+  // Middleware to track all requests
+  middleware() {
+    const tracker = this; // Capture the tracker instance
+
+    return async (req, res, next) => {
+      if (isMetricsDisabled() || !tracker.shouldTrackRequest(req)) {
+        return next();
+      }
+
+      const start = process.hrtime();
+      let responseTracked = false;
+
+      // Track request start
+      tracker.trackRequest(req);
+
+      // Helper to track response once
+      const trackOnce = function () {
+        if (!responseTracked) {
+          responseTracked = true;
+          const [seconds, nanoseconds] = process.hrtime(start);
+          const responseTime = (seconds * 1000) + (nanoseconds / 1e6);
+          tracker.trackResponse(req, res, responseTime).catch(err => {
+            logger.warn('[Request Tracker] Failed to track response:', err.message);
+          });
+        }
+      };
+
+      // Primary tracking via finish event (most reliable)
+      res.on("finish", trackOnce);
+
+      // Keep minimal patching as safety net for edge cases
+      const originalSend = res.send;
+      res.send = function (data) {
+        trackOnce();
+        return originalSend.call(this, data);
+      };
+
+      next();
+    };
+  }
+
+  shouldTrackRequest(req) {
+    const path = req.path;
+
+    // --- Ignore common static file extensions ---
+    const staticFileExtensions =
+      /\.(js|css|ico|png|svg|jpg|jpeg|webp|webmanifest|map)$/;
+    if (staticFileExtensions.test(path)) {
+      return false; // Do not track static file requests
+    }
+
+    // --- Existing filter for API and page routes ---
+    const internalPaths = [
+      "/api/dashboard",
+      "/api/admin",
+      "/dashboard",
+      "/api/config",
+      "/api/test-keys",
+      "/health",
+      "/favicon.ico",
+      "/background.png",
+      "/logo.png",
+    ];
+
+    return !internalPaths.some((prefix) => path.startsWith(prefix));
+  }
+
+  // Track incoming request
+  async trackRequest(req) {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const hour = new Date().toISOString().substring(0, 13);
+
+      this.trackContentRequest(req);
+
+      redis.incr(`requests:total`).catch(() => {});
+      redis.incr(`requests:${today}`).catch(() => {});
+      redis.incr(`requests:${hour}`).catch(() => {});
+      redis.expire(`requests:${today}`, 86400 * 30).catch(() => {}); // 30 days
+      redis.expire(`requests:${hour}`, 86400 * 31).catch(() => {}); // 31 days
+
+      // Track metadata requests for activity feed
+      const normalizedPath = this.normalizeEndpoint(req.path);
+      if (
+        normalizedPath.includes("/meta/") ||
+        normalizedPath.includes("/catalog/")
+      ) {
+        const activityDetails = {
+          endpoint: normalizedPath,
+          userAgent: this.hashString(req.headers["user-agent"] || "unknown"),
+          method: req.method,
+        };
+
+        if (normalizedPath.includes("/meta/")) {
+          this.trackActivity("metadata_request", activityDetails);
+        } else if (normalizedPath.includes("/catalog/")) {
+          this.trackActivity("catalog_request", activityDetails);
+        }
+      }
+    } catch (error) {
+      logger.warn("[Request Tracker] Failed to track request:", error.message);
+    }
+  }
+
+  // Track response
+  async trackResponse(req, res, responseTime) {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const endpoint = this.normalizeEndpoint(req.path);
+      const statusCode = res.statusCode;
+      const shouldTrack = this.shouldTrackRequest(req);
+
+      if (shouldTrack) {
+        const userIdentifier = this.getImprovedUserIdentifier(req);
+        this.trackActiveUser(userIdentifier, req).catch(() => {});
+
+        const hour = new Date().toISOString().substring(0, 13);
+        redis.lpush(`response_times:${hour}`, responseTime).catch(() => {});
+        redis.ltrim(`response_times:${hour}`, 0, 999).catch(() => {}); // Keep last 1000 for hourly averages
+        redis.expire(`response_times:${hour}`, 86400 * 7).catch(() => {}); // 7 days expiration
+
+        // Track errors
+        if (statusCode >= 400) {
+          redis.incr(`errors:total`).catch(() => {});
+          redis.incr(`errors:${today}`).catch(() => {});
+        } else {
+          redis.incr(`success:${today}`).catch(() => {});
+          redis.expire(`success:${today}`, 86400 * 30).catch(() => {});
+        }
+      }
+
+      // Track catalog/search success
+      if (req.path.includes("/catalog/")) {
+        let rawSearch = "";
+        // Query param
+        if (req.query && req.query.search) {
+          rawSearch = String(req.query.search);
+        }
+        // Path extras
+        if (!rawSearch) {
+          try {
+            const extrasMatch = req.path.match(
+              /\/catalog\/[^/]+\/[^/]+\/(.*)\.(json|xml)$/i,
+            );
+            if (extrasMatch && extrasMatch[1]) {
+              const extrasPart = extrasMatch[1];
+              const segments = extrasPart.split("/");
+              for (const segment of segments) {
+                if (segment.toLowerCase().startsWith("search=")) {
+                  const val = segment.substring("search=".length);
+                  rawSearch = decodeURIComponent(val);
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+        const queryNorm = rawSearch.toLowerCase().trim();
+        
+        if (queryNorm) {
+          // Determine type for optional per-type success storage
+          let catalogType = "all";
+          try {
+            const catalogMatch = req.path.match(/\/catalog\/([^/]+)/);
+            if (catalogMatch && catalogMatch[1])
+              catalogType = catalogMatch[1].toLowerCase();
+          } catch (_) {}
+
+          const resultsCount = res.locals?.resultCount ?? 0;
+
+          // Track search success if results were found
+          if (resultsCount > 0) {
+            redis
+              .zincrby(`search_success:${today}`, 1, queryNorm)
+              .catch(() => {});
+            redis.expire(`search_success:${today}`, 86400 * 30).catch(() => {});
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn("[Request Tracker] Failed to track response:", error.message);
+    }
+  }
+
+  // Normalize endpoint for tracking (remove IDs, etc.)
+  normalizeEndpoint(path) {
+    return path
+      .replace(/\/[a-f0-9-]{36}/g, "/:uuid") // UUIDs (must come before ObjectId regex)
+      .replace(/\/[a-f0-9]{24}/g, "/:id") // MongoDB ObjectIds
+      .replace(/\/\d+/g, "/:id") // Numeric IDs
+      .replace(/\/[a-zA-Z0-9_-]{8,}/g, "/:param") // Long params
+      .toLowerCase();
+  }
+
+  // Simple hash function for user-agent
+  hashString(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash).toString(16);
+  }
+
+  // Normalize content ID for metadata tracking
+  normalizeContentId(rawId) {
+    let id = decodeURIComponent(rawId || "");
+    id = id.replace(/\.(json|xml)$/i, "");
+    return id;
+  }
+
+  // Generate canonical metadata key
+  canonicalContentMetadataKey(type, rawId) {
+    return `content_metadata:${type}:${this.normalizeContentId(rawId)}`;
+  }
+
+  // Track content requests (meta, search, catalog)
+  async trackContentRequest(req) {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const path = req.path;
+      const today = new Date().toISOString().split("T")[0];
+
+      // Track meta requests
+      if (path.includes("/meta/")) {
+        const metaMatch = path.match(/\/meta\/([^/]+)\/([^/]+)/);
+        if (metaMatch) {
+          let [, type, id] = metaMatch;
+
+          // Store the original ID for tracking (with URL encoding)
+          const originalId = id;
+
+          // Also store a cleaned version for metadata lookup
+          const cleanId = this.normalizeContentId(id);
+
+          const cleanContentKey = `${type}:${cleanId}`;
+
+          // Track popular content using normalized key to prevent duplicates
+          redis
+            .zincrby(`popular_content:${today}`, 1, cleanContentKey)
+            .catch(() => {});
+          redis.expire(`popular_content:${today}`, 86400 * 30).catch(() => {}); // 30 days
+        }
+      }
+
+      // Track search requests
+      if (path.includes("/catalog/")) {
+        let rawSearch = "";
+
+        // Case 1: standard query parameter (e.g., ?search=foo)
+        if (req.query && req.query.search) {
+          rawSearch = String(req.query.search);
+        }
+
+        // Case 2: Stremio-style extras in the path: /catalog/{type}/{id}/.../search={query}.json
+        // Example: /catalog/movie/mdblist.12345/genre=action/search=star%20wars.json
+        if (!rawSearch) {
+          try {
+            const extrasMatch = path.match(
+              /\/catalog\/[^/]+\/[^/]+\/(.*)\.(json|xml)$/i,
+            );
+            if (extrasMatch && extrasMatch[1]) {
+              const extrasPart = extrasMatch[1];
+              const segments = extrasPart.split("/");
+              for (const segment of segments) {
+                if (segment.toLowerCase().startsWith("search=")) {
+                  const val = segment.substring("search=".length);
+                  rawSearch = decodeURIComponent(val);
+                  break;
+                }
+              }
+            }
+          } catch (_) {
+            // ignore parsing errors; fall through
+          }
+        }
+
+        const searchQuery = rawSearch.toLowerCase().trim();
+        if (searchQuery) {
+          // Determine catalog type (movie/series/anime/etc.) if present
+          let catalogType = "all";
+          try {
+            const catalogMatch = path.match(/\/catalog\/([^/]+)/);
+            if (catalogMatch && catalogMatch[1]) {
+              catalogType = catalogMatch[1].toLowerCase();
+            }
+          } catch (_) {}
+
+          // Debounce per user + query for a short window to avoid overcounting
+          const userHash = this.getImprovedUserIdentifier(req);
+          const dedupeKey = `search_dedupe:${today}:${userHash}:${catalogType}:${searchQuery}`;
+          
+          redis.set(dedupeKey, "1", "NX", "EX", 3)
+            .then(setResult => {
+              if (setResult) {
+                // Increment global aggregate
+                Promise.all([
+                  redis.zincrby(`search_patterns:${today}`, 1, searchQuery),
+                  redis.expire(`search_patterns:${today}`, 86400 * 30),
+                ]).catch(() => {});
+              }
+            })
+            .catch(() => {
+              // On Redis error, fall back to naive increment
+              Promise.all([
+                redis.zincrby(`search_patterns:${today}`, 1, searchQuery),
+                redis.expire(`search_patterns:${today}`, 86400 * 30)
+              ]).catch(() => {});
+            });
+        }
+      }
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to track content request:",
+        error.message,
+      );
+    }
+  }
+
+  // Get popular content
+  async getPopularContent(limit = 50, days = 1, tz = null) {
+    try {
+      const dates = dateKeysForRange(days, tz);
+
+      const results = await Promise.all(
+        dates.map(date => redis.zrevrange(`popular_content:${date}`, 0, limit - 1, "WITHSCORES"))
+      );
+
+      const contentMap = new Map();
+      for (const dayData of results) {
+        for (let i = 0; i < dayData.length; i += 2) {
+          const contentKey = dayData[i];
+          const score = parseInt(dayData[i + 1]) || 0;
+          contentMap.set(contentKey, (contentMap.get(contentKey) || 0) + score);
+        }
+      }
+
+      // Convert to array and enrich with metadata
+      const contentEntries = Array.from(contentMap.entries())
+        .map(([contentKey, requests]) => {
+          const [type, id] = contentKey.split(":");
+          return { contentKey, type, id, requests };
+        })
+        .sort((a, b) => b.requests - a.requests)
+        .slice(0, limit);
+
+      // Enrich with cached metadata
+      const popularContent = await Promise.all(
+        contentEntries.map(async ({ contentKey, type, id, requests }) => {
+          try {
+            // Extract id from contentKey. If the key is already normalized, this is fine.
+            // If it's from old tracked data, we normalize it here.
+            const parts = contentKey.split(":");
+            const keyType = parts[0];
+            const rawId = parts.slice(1).join(":");
+            
+            const canonicalKey = this.canonicalContentMetadataKey(keyType, rawId);
+            let metadataStr = null;
+            try {
+              metadataStr = await redis.get(canonicalKey);
+            } catch (_) {}
+
+            if (metadataStr) {
+              const metadata = JSON.parse(metadataStr);
+              return {
+                id,
+                type: metadata.type || type,
+                requests,
+                title: metadata.title,
+                rating: metadata.rating,
+                year: metadata.year,
+                // poster: metadata.poster, // Not used in dashboard UI
+                imdb_id: metadata.imdb_id,
+              };
+            }
+          } catch (error) {
+            logger.warn(
+              "[Request Tracker] Failed to load metadata for",
+              contentKey,
+              error.message,
+            );
+          }
+
+          // Fallback to formatted title
+          //logger.info(`[Request Tracker] Using fallback title for ${contentKey}: "${this.formatContentTitle(id, type)}"`);
+          return {
+            id,
+            type,
+            requests,
+            title: this.formatContentTitle(id, type),
+            rating: null,
+            year: null,
+          };
+        }),
+      );
+
+      return popularContent;
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get popular content:", error);
+      return [];
+    }
+  }
+
+  async getTrendingContent(limit = 10, tz = null) {
+    try {
+      const dayKey = (i) => {
+        const d = new Date(Date.now() - i * 86400000);
+        if (tz) {
+          try { return d.toLocaleDateString("en-CA", { timeZone: tz }); } catch {}
+        }
+        return d.toISOString().split("T")[0];
+      };
+      const thisWeekDates = [...new Set(Array.from({ length: 7 }, (_, i) => dayKey(i)))];
+      const lastWeekDates = [...new Set(Array.from({ length: 7 }, (_, i) => dayKey(i + 7)))];
+
+      const aggregate = async (dates) => {
+        const results = await Promise.all(
+          dates.map(date => redis.zrevrange(`popular_content:${date}`, 0, 200, "WITHSCORES"))
+        );
+        const map = new Map();
+        for (const dayData of results) {
+          for (let i = 0; i < dayData.length; i += 2) {
+            const key = dayData[i];
+            const score = parseInt(dayData[i + 1]) || 0;
+            map.set(key, (map.get(key) || 0) + score);
+          }
+        }
+        return map;
+      };
+
+      const [thisWeek, lastWeek] = await Promise.all([
+        aggregate(thisWeekDates),
+        aggregate(lastWeekDates),
+      ]);
+
+      const hasPriorWeek = lastWeek.size > 0;
+
+      const entries = Array.from(thisWeek.entries())
+        .map(([contentKey, requests]) => ({ contentKey, requests, prev: lastWeek.get(contentKey) || 0 }))
+        .sort((a, b) => b.requests - a.requests)
+        .slice(0, limit);
+
+      return await Promise.all(
+        entries.map(async ({ contentKey, requests, prev }) => {
+          const parts = contentKey.split(":");
+          const keyType = parts[0];
+          const id = parts.slice(1).join(":");
+
+          let meta = null;
+          try {
+            const str = await redis.get(this.canonicalContentMetadataKey(keyType, id));
+            if (str) meta = JSON.parse(str);
+          } catch (_) {}
+
+          return {
+            id,
+            type: meta?.type || keyType,
+            title: meta?.title || this.formatContentTitle(id, keyType),
+            rating: meta?.rating || null,
+            year: meta?.year || null,
+            poster: meta?.poster || null,
+            landscapePoster: meta?.landscapePoster || null,
+            imdb_id: meta?.imdb_id || null,
+            requests,
+            prevRequests: prev,
+            deltaPct: hasPriorWeek && prev >= 5 ? Math.round(((requests - prev) / prev) * 100) : null,
+            isNew: hasPriorWeek && prev === 0,
+          };
+        }),
+      );
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get trending content:", error);
+      return [];
+    }
+  }
+
+  async getSearchPatterns(limit = 50, days = 1, tz = null) {
+    try {
+      const dates = dateKeysForRange(days, tz);
+
+      const searchResults = await Promise.all(
+        dates.map(date => redis.zrevrange(`search_patterns:${date}`, 0, limit - 1, "WITHSCORES"))
+      );
+      const successResults = await Promise.all(
+        dates.map(date => redis.zrevrange(`search_success:${date}`, 0, -1, "WITHSCORES"))
+      );
+
+      const searchMap = new Map();
+      const successMap = new Map();
+
+      for (const dayData of searchResults) {
+        for (let i = 0; i < dayData.length; i += 2) {
+          const query = dayData[i];
+          const count = parseInt(dayData[i + 1]) || 0;
+          searchMap.set(query, (searchMap.get(query) || 0) + count);
+        }
+      }
+
+      for (const dayData of successResults) {
+        for (let i = 0; i < dayData.length; i += 2) {
+          const query = dayData[i];
+          const count = parseInt(dayData[i + 1]) || 0;
+          successMap.set(query, (successMap.get(query) || 0) + count);
+        }
+      }
+
+      // Convert to array and sort
+      const searchPatterns = Array.from(searchMap.entries())
+        .map(([query, count]) => ({
+          query,
+          count,
+          success:
+            count > 0
+              ? Math.max(
+                  0,
+                  Math.min(
+                    100,
+                    Math.round(((successMap.get(query) || 0) / count) * 100),
+                  ),
+                )
+              : 0,
+        }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, limit);
+
+      return searchPatterns;
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get search patterns:", error);
+      return [];
+    }
+  }
+  // Capture metadata from complete meta components
+  // NOTE: This function intentionally runs even when DISABLE_METRICS=true because it stores
+  // content_metadata for the rating page functionality, not just telemetry/analytics metrics.
+  async captureMetadataFromComponents(metaId, meta, metaType, buildLanguage = null) {
+    try {
+      if (!meta || !meta.name) return;
+
+      const type = meta.type || metaType || "unknown";
+      const canonicalKey = this.canonicalContentMetadataKey(type, metaId);
+
+      const preferredLang = (process.env.DASHBOARD_METADATA_LANGUAGE || "en").split("-")[0].toLowerCase();
+      const buildLang = (buildLanguage || "").split("-")[0].toLowerCase();
+      const buildIsPreferred = !preferredLang || (!!buildLang && buildLang === preferredLang);
+
+      let title = meta.name;
+      let titleLang = buildLang || null;
+
+      if (preferredLang && !buildIsPreferred) {
+        let existing = null;
+        try {
+          const existingStr = await redis.get(canonicalKey);
+          if (existingStr) existing = JSON.parse(existingStr);
+        } catch (_) {}
+        if (existing && existing.title_lang === preferredLang && existing.title) {
+          title = existing.title;
+          titleLang = preferredLang;
+        }
+      }
+
+      // Store metadata for later lookup
+      const metadataInfo = {
+        title,
+        title_lang: titleLang,
+        type: meta.type || metaType,
+        rating: meta.imdbRating || meta.rating || null,
+        year: meta.year || null,
+        description: meta.description || null,
+        poster: meta.poster || null,
+        landscapePoster: meta.landscapePoster || meta.background || null,
+        imdb_id: meta.imdb_id || null,
+        cached_at: new Date().toISOString(),
+      };
+
+      const metadataPayload = JSON.stringify(metadataInfo);
+
+      logger.debug(
+        `[Request Tracker] Storing canonical metadata for ${canonicalKey.replace("content_metadata:", "")}: "${metadataInfo.title}" ⭐${metadataInfo.rating}`,
+      );
+
+      // Store in Redis with 30 day TTL
+      redis.set(canonicalKey, metadataPayload, "EX", 86400 * 30).catch(() => {});
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to capture metadata from components:",
+        error.message,
+      );
+    }
+  }
+
+  // Format content title from ID
+  formatContentTitle(id, type) {
+    try {
+      // Handle URL-encoded IDs
+      let decodedId = decodeURIComponent(id);
+
+      // Remove file extensions
+      decodedId = decodedId.replace(/\.(json|xml)$/i, "");
+
+      // Handle TMDB format: "tmdb:123456" or "Tmdb%3A123456"
+      if (decodedId.match(/^tmdb[:%]?\d+$/i)) {
+        const tmdbId = decodedId.replace(/^tmdb[:%]?/i, "");
+        return `TMDB Movie ${tmdbId}`;
+      }
+
+      // Handle IMDB format: "tt1234567"
+      if (decodedId.match(/^tt\d+$/)) {
+        return `IMDB ${decodedId}`;
+      }
+
+      // Handle other provider formats
+      if (decodedId.includes(":")) {
+        const [provider, itemId] = decodedId.split(":");
+        return `${provider.toUpperCase()} ${itemId}`;
+      }
+
+      // Basic cleanup for other IDs
+      return decodedId
+        .replace(/[_-]/g, " ")
+        .replace(/\b\w/g, (l) => l.toUpperCase())
+        .trim();
+    } catch (error) {
+      // Fallback to original ID if formatting fails
+      return id;
+    }
+  }
+
+  // Track cache hit/miss
+  async trackCacheHit() {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      redis.incr(`cache:hits:${today}`).catch(() => {});
+      redis.expire(`cache:hits:${today}`, 86400 * 30).catch(() => {});
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to track cache hit:",
+        error.message,
+      );
+    }
+  }
+
+  async trackCacheMiss() {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      redis.incr(`cache:misses:${today}`).catch(() => {});
+      redis.expire(`cache:misses:${today}`, 86400 * 30).catch(() => {});
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to track cache miss:",
+        error.message,
+      );
+    }
+  }
+
+  // Track provider API calls
+  async trackProviderCall(
+    provider,
+    responseTime,
+    success = true,
+    rateLimitHeaders = null,
+  ) {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const hour = new Date().toISOString().substring(0, 13);
+
+      // Track response times hourly
+      redis
+        .lpush(`provider_response_times:${provider}:${hour}`, responseTime)
+        .catch(() => {});
+      redis
+        .ltrim(`provider_response_times:${provider}:${hour}`, 0, 999)
+        .catch(() => {});
+      redis
+        .expire(`provider_response_times:${provider}:${hour}`, 3600 * 48)
+        .catch(() => {}); // 48 hours
+
+      // Track success/error rates
+      if (success) {
+        redis.incr(`provider_success:${provider}:${today}`).catch(() => {});
+      } else {
+        redis.incr(`provider_errors:${provider}:${today}`).catch(() => {});
+      }
+      redis
+        .expire(`provider_success:${provider}:${today}`, 86400 * 2)
+        .catch(() => {}); // 2 days
+      redis
+        .expire(`provider_errors:${provider}:${today}`, 86400 * 2)
+        .catch(() => {}); // 2 days
+
+      // Track hourly calls for rate limiting awareness
+      redis.incr(`provider_calls:${provider}:${hour}`).catch(() => {});
+      redis
+        .expire(`provider_calls:${provider}:${hour}`, 3600 * 24)
+        .catch(() => {}); // 24 hours
+
+      // Store real rate limit data if available
+      if (rateLimitHeaders) {
+        const rateLimitData = {
+          limit: rateLimitHeaders.limit,
+          remaining: rateLimitHeaders.remaining,
+          reset: rateLimitHeaders.reset,
+          timestamp: Date.now(),
+        };
+
+        redis
+          .setex(
+            `provider_rate_limit:${provider}`,
+            3600,
+            JSON.stringify(rateLimitData),
+          )
+          .catch(() => {});
+      }
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to track provider call:",
+        error.message,
+      );
+    }
+  }
+
+  /**
+   * Log a provider error to the dashboard error management system.
+   * Use this for significant errors that admins should be aware of.
+   * 
+   * @param {string} provider - Provider name (e.g., 'tmdb', 'tvdb', 'anilist', 'mal', 'kitsu')
+   * @param {string} errorType - Type of error: 'rate_limit', 'timeout', 'server_error', 'auth_error', 'api_error'
+   * @param {string} message - Human-readable error message
+   * @param {Object} details - Additional context (endpoint, status, responseTime, etc.)
+   */
+  logProviderError(provider, errorType, message, details = {}) {
+    // Skip if metrics collection is disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+
+    // Determine log level based on error type
+    let level = 'error';
+    if (errorType === 'rate_limit' || errorType === 'timeout') {
+      level = 'warning';
+    }
+
+    // Add provider to details for filtering
+    const enrichedDetails = {
+      provider,
+      errorType,
+      ...details,
+    };
+
+    // Log to dashboard error system
+    this.logError(level, `[${provider.toUpperCase()}] ${message}`, enrichedDetails);
+  }
+
+  // Get provider performance statistics
+  async getProviderPerformance() {
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const yesterday = new Date(Date.now() - 86400000)
+        .toISOString()
+        .split("T")[0];
+      const providers = [
+        "tmdb",
+        "tvdb",
+        "mal",
+        "anilist",
+        "kitsu",
+        "fanart",
+        "tvmaze",
+      ];
+
+      const providerStats = await Promise.all(
+        providers.map(async (provider) => {
+          try {
+            // Get response times for the last 24 hours (multiple hourly buckets)
+            const now = new Date();
+            const hours = [];
+            for (let i = 0; i < 24; i++) {
+              const hour = new Date(now.getTime() - i * 3600000)
+                .toISOString()
+                .substring(0, 13);
+              hours.push(hour);
+            }
+
+            // Get response times from all hourly buckets
+            const timePromises = hours.map(async (hour) => {
+              try {
+                return await redis.lrange(
+                  `provider_response_times:${provider}:${hour}`,
+                  0,
+                  -1,
+                );
+              } catch (error) {
+                // Handle WRONGTYPE errors gracefully
+                if (error.message.includes("WRONGTYPE")) {
+                  logger.warn(
+                    `[Request Tracker] Wrong data type for ${provider}:${hour}, skipping`,
+                  );
+                  return [];
+                }
+                throw error;
+              }
+            });
+            const timeResults = await Promise.all(timePromises);
+
+            // Flatten all response times
+            const allTimes = timeResults
+              .flat()
+              .map((t) => parseFloat(t))
+              .filter((t) => !isNaN(t));
+            const avgResponseTime =
+              allTimes.length > 0
+                ? Math.round(
+                    allTimes.reduce((a, b) => a + b, 0) / allTimes.length,
+                  )
+                : 0;
+
+            // Get success/error rates
+            const [
+              todaySuccess,
+              todayErrors,
+              yesterdaySuccess,
+              yesterdayErrors,
+            ] = await Promise.all([
+              redis.get(`provider_success:${provider}:${today}`),
+              redis.get(`provider_errors:${provider}:${today}`),
+              redis.get(`provider_success:${provider}:${yesterday}`),
+              redis.get(`provider_errors:${provider}:${yesterday}`),
+            ]);
+
+            const totalSuccess =
+              (parseInt(todaySuccess) || 0) + (parseInt(yesterdaySuccess) || 0);
+            const totalErrors =
+              (parseInt(todayErrors) || 0) + (parseInt(yesterdayErrors) || 0);
+            const totalCalls = totalSuccess + totalErrors;
+
+            const errorRate =
+              totalCalls > 0
+                ? parseFloat(((totalErrors / totalCalls) * 100).toFixed(1))
+                : 0;
+
+            // Determine status based on error rate and response time
+            let status = "healthy";
+            if (errorRate > 10 || avgResponseTime > 3000) {
+              status = "error";
+            } else if (errorRate > 5 || avgResponseTime > 1500) {
+              status = "warning";
+            }
+
+            // Don't include providers with no data
+            if (totalCalls === 0 && avgResponseTime === 0) {
+              return null;
+            }
+
+            return {
+              name: provider.toUpperCase(),
+              responseTime: avgResponseTime,
+              errorRate: errorRate,
+              status: status,
+              totalCalls: totalCalls,
+            };
+          } catch (providerError) {
+            logger.warn(
+              `[Request Tracker] Failed to get stats for provider ${provider}:`,
+              providerError.message,
+            );
+            return null;
+          }
+        }),
+      );
+
+      // Filter out providers with no data and sort by usage
+      return providerStats
+        .filter((stat) => stat !== null)
+        .sort((a, b) => b.totalCalls - a.totalCalls);
+    } catch (error) {
+      logger.error(
+        "[Request Tracker] Failed to get provider performance:",
+        error,
+      );
+      return [];
+    }
+  }
+
+  // Track recent activity
+  async trackActivity(type, details) {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      logger.debug(
+        `[Request Tracker] Tracking activity: ${type} for ${details.endpoint}`,
+      );
+
+      const activity = {
+        id: Date.now(),
+        type: type,
+        details: details,
+        timestamp: new Date().toISOString(),
+        userAgent: this.hashString(details.userAgent || "unknown"),
+      };
+
+      // Store in recent activity list (keep last 100 activities)
+      const activityKey = "recent_activity";
+      await redis.lpush(activityKey, JSON.stringify(activity));
+      await redis.ltrim(activityKey, 0, 99); // Keep only last 100
+      await redis.expire(activityKey, 86400 * 7); // 7 days
+
+      logger.debug(`[Request Tracker] Activity stored successfully: ${type}`);
+    } catch (error) {
+      logger.warn("[Request Tracker] Failed to track activity:", error.message);
+    }
+  }
+
+  // Get recent activity
+  async getRecentActivity(limit = 20) {
+    try {
+      logger.info("[Request Tracker] Getting recent activity...");
+
+      const activities = await redis.lrange("recent_activity", 0, limit - 1);
+      logger.info(
+        `[Request Tracker] Found ${activities.length} activities in Redis`,
+      );
+
+      const parsedActivities = activities.map((activity) =>
+        JSON.parse(activity),
+      );
+      logger.info(
+        `[Request Tracker] Returning ${parsedActivities.length} parsed activities`,
+      );
+
+      return parsedActivities;
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to get recent activity:",
+        error.message,
+      );
+      return [];
+    }
+  }
+
+  // Get cache hit rate
+  async getCacheHitRate() {
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const yesterday = new Date(Date.now() - 86400000)
+        .toISOString()
+        .split("T")[0];
+
+      const [todayHits, todayMisses, yesterdayHits, yesterdayMisses] =
+        await Promise.all([
+          redis.get(`cache:hits:${today}`),
+          redis.get(`cache:misses:${today}`),
+          redis.get(`cache:hits:${yesterday}`),
+          redis.get(`cache:misses:${yesterday}`),
+        ]);
+
+      // Combine today and yesterday for more stable metrics
+      const totalHits =
+        (parseInt(todayHits) || 0) + (parseInt(yesterdayHits) || 0);
+      const totalMisses =
+        (parseInt(todayMisses) || 0) + (parseInt(yesterdayMisses) || 0);
+      const totalRequests = totalHits + totalMisses;
+
+      if (totalRequests === 0) {
+        return 0; // No cache data yet
+      }
+
+      return Math.round((totalHits / totalRequests) * 100);
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get cache hit rate:", error);
+      return 0;
+    }
+  }
+
+  // Get request statistics
+  async getStats(tz = null) {
+    try {
+      const today = todayKey(tz);
+      const yesterday = yesterdayKey(tz);
+
+      // Add timeout to Redis operations
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Redis timeout")), 5000),
+      );
+
+      const [
+        totalRequests,
+        todayRequests,
+        yesterdayRequests,
+        totalErrors,
+        todayErrors,
+        todaySuccess,
+      ] = await Promise.race([
+        Promise.all([
+          redis.get("requests:total"),
+          redis.get(`requests:${today}`),
+          redis.get(`requests:${yesterday}`),
+          redis.get("errors:total"),
+          redis.get(`errors:${today}`),
+          redis.get(`success:${today}`),
+        ]),
+        timeout,
+      ]);
+
+      const todayReq = parseInt(todayRequests) || 0;
+      const todayErr = parseInt(todayErrors) || 0;
+      const todaySucc = parseInt(todaySuccess) || 0;
+
+      // Calculate rates based on tracked responses (success + errors)
+      // This avoids showing misleading percentages when some requests aren't tracked
+      const trackedResponses = todaySucc + todayErr;
+      const successRate =
+        trackedResponses > 0
+          ? parseFloat(((todaySucc / trackedResponses) * 100).toFixed(1))
+          : 0;
+      const errorRate =
+        trackedResponses > 0
+          ? parseFloat(((todayErr / trackedResponses) * 100).toFixed(1))
+          : 0;
+
+      // Log warning if there's a significant tracking gap
+      if (todayReq > 0 && trackedResponses < todayReq * 0.9) {
+        logger.warn(
+          `[Request Tracker] Tracking gap detected: ${todayReq} requests but only ${trackedResponses} tracked responses (${Math.round((trackedResponses / todayReq) * 100)}% coverage)`,
+        );
+      }
+
+      const trackingCoverage =
+        todayReq > 0
+          ? parseFloat(((trackedResponses / todayReq) * 100).toFixed(1))
+          : 100;
+
+      return {
+        totalRequests: parseInt(totalRequests) || 0,
+        todayRequests: todayReq,
+        yesterdayRequests: parseInt(yesterdayRequests) || 0,
+        totalErrors: parseInt(totalErrors) || 0,
+        todayErrors: todayErr,
+        todaySuccess: todaySucc,
+        trackedResponses: trackedResponses,
+        successRate: Math.min(successRate, 100), // Cap at 100%
+        errorRate: Math.min(errorRate, 100), // Cap at 100%
+        trackingCoverage: trackingCoverage, // % of requests that were tracked
+      };
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get stats:", error);
+      return {
+        totalRequests: 0,
+        todayRequests: 0,
+        yesterdayRequests: 0,
+        totalErrors: 0,
+        todayErrors: 0,
+        todaySuccess: 0,
+        trackedResponses: 0,
+        successRate: 0,
+        errorRate: 0,
+        trackingCoverage: 100,
+      };
+    }
+  }
+
+  // Get hourly request data for charts
+  async getHourlyStats(hours = 24, tz = null) {
+    try {
+      const hourlyData = [];
+      const now = new Date();
+
+      for (let i = hours - 1; i >= 0; i--) {
+        const hour = new Date(now.getTime() - i * 60 * 60 * 1000);
+        const hourKey = hour.toISOString().substring(0, 13);
+        const requests = await redis.get(`requests:${hourKey}`);
+
+        const responseTimesKey = `response_times:${hourKey}`;
+        const responseTimes = await redis.lrange(responseTimesKey, 0, -1);
+        const avgResponseTime =
+          responseTimes.length > 0
+            ? responseTimes.reduce((sum, time) => sum + parseInt(time), 0) /
+              responseTimes.length
+            : 0;
+
+        let displayHour = hour.getHours();
+        if (tz) {
+          try { displayHour = parseInt(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', hour12: false }).format(hour)) || 0; if (displayHour === 24) displayHour = 0; } catch {}
+        }
+
+        hourlyData.push({
+          hour: displayHour,
+          requests: parseInt(requests) || 0,
+          responseTime: Math.round(avgResponseTime),
+          timestamp: hour.toISOString(),
+        });
+      }
+
+      return hourlyData;
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get hourly stats:", error);
+      return [];
+    }
+  }
+
+  async getActivityHeatmap(days = 7, tz = null) {
+    try {
+      const totalHours = days * 24;
+      const now = new Date();
+      const keys = [];
+      const timestamps = [];
+
+      for (let i = totalHours - 1; i >= 0; i--) {
+        const hour = new Date(now.getTime() - i * 60 * 60 * 1000);
+        keys.push(`requests:${hour.toISOString().substring(0, 13)}`);
+        timestamps.push(hour);
+      }
+
+      const pipeline = redis.pipeline();
+      for (const key of keys) pipeline.get(key);
+      const results = await pipeline.exec();
+
+      const grid = Array.from({ length: 7 }, () => new Array(24).fill(0));
+      let peak = 0;
+
+      const fmt = tz ? { timeZone: tz } : undefined;
+      for (let i = 0; i < timestamps.length; i++) {
+        const val = results[i]?.[1] ? parseInt(results[i][1]) : 0;
+        if (val <= 0) continue;
+        let day, hour;
+        if (fmt) {
+          try {
+            const parts = new Intl.DateTimeFormat('en-US', { ...fmt, weekday: 'short', hour: 'numeric', hour12: false }).formatToParts(timestamps[i]);
+            const weekday = parts.find(p => p.type === 'weekday')?.value;
+            const dayMap = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 };
+            day = dayMap[weekday] ?? (timestamps[i].getDay() + 6) % 7;
+            hour = parseInt(parts.find(p => p.type === 'hour')?.value) || 0;
+            if (hour === 24) hour = 0;
+          } catch {
+            day = (timestamps[i].getDay() + 6) % 7;
+            hour = timestamps[i].getHours();
+          }
+        } else {
+          day = (timestamps[i].getDay() + 6) % 7;
+          hour = timestamps[i].getHours();
+        }
+        grid[day][hour] += val;
+        if (grid[day][hour] > peak) peak = grid[day][hour];
+      }
+
+      return { grid, peak };
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get activity heatmap:", error);
+      return { grid: Array.from({ length: 7 }, () => new Array(24).fill(0)), peak: 0 };
+    }
+  }
+
+  // Get hourly provider response time data for charts
+  async getHourlyProviderStats(hours = 24, tz = null) {
+    try {
+      const providers = [
+        "tmdb",
+        "tvdb",
+        "mal",
+        "anilist",
+        "kitsu",
+        "fanart",
+        "tvmaze",
+        "trakt",
+        "mdblist",
+        "letterboxd",
+      ];
+      const hourlyData = [];
+      const now = new Date();
+
+      for (let i = hours - 1; i >= 0; i--) {
+        const hour = new Date(now.getTime() - i * 60 * 60 * 1000);
+        const hourKey = hour.toISOString().substring(0, 13);
+
+        let displayHour = hour.getHours();
+        if (tz) {
+          try { displayHour = parseInt(new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', hour12: false }).format(hour)) || 0; if (displayHour === 24) displayHour = 0; } catch {}
+        }
+
+        const hourStats = {
+          hour: displayHour,
+          timestamp: hour.toISOString(),
+        };
+
+        for (const provider of providers) {
+          const responseTimes = await redis.lrange(
+            `provider_response_times:${provider}:${hourKey}`,
+            0,
+            -1,
+          );
+          if (responseTimes.length > 0) {
+            const avgResponseTime =
+              responseTimes.reduce((sum, time) => sum + parseInt(time), 0) /
+              responseTimes.length;
+            hourStats[provider] = Math.round(avgResponseTime);
+          } else {
+            hourStats[provider] = null; // Use null for no data
+          }
+        }
+        hourlyData.push(hourStats);
+      }
+
+      return hourlyData;
+    } catch (error) {
+      logger.error(
+        "[Request Tracker] Failed to get hourly provider stats:",
+        error,
+      );
+      return [];
+    }
+  }
+
+  
+  // Stub to maintain API compatibility until frontend/callers are updated
+  async getTopEndpoints(limit = 10) {
+    return [];
+  }
+
+
+  // Log detailed error for dashboard
+  async logError(level, message, details = {}) {
+    // Skip metrics collection if disabled
+    if (isMetricsDisabled()) {
+      return;
+    }
+    try {
+      const errorId = Date.now().toString();
+      const timestamp = new Date().toISOString();
+
+      const errorLog = {
+        id: errorId,
+        level: level, // 'error', 'warning', 'info'
+        message: message,
+        details: details,
+        timestamp: timestamp,
+        count: 1,
+      };
+
+      // Store in Redis with 7 day TTL using pipeline (fire-and-forget)
+      redis.pipeline()
+        .set(`error_log:${errorId}`, JSON.stringify(errorLog), "EX", 86400 * 7)
+        .zadd("error_logs", Date.now(), errorId)
+        .expire("error_logs", 86400 * 7)
+        .exec()
+        .catch(() => {});
+
+      logger.info(`[Request Tracker] Logged ${level}: ${message}`);
+    } catch (error) {
+      logger.warn("[Request Tracker] Failed to log error:", error.message);
+    }
+  }
+
+  // Get recent error logs
+  async getErrorLogs(limit = 50) {
+    try {
+      // Get recent error IDs from sorted set
+      const errorIds = await redis.zrevrange("error_logs", 0, limit - 1);
+
+      if (errorIds.length === 0) {
+        return [];
+      }
+
+      // Get error details for each ID
+      const errorLogs = await Promise.all(
+        errorIds.map(async (errorId) => {
+          try {
+            const errorStr = await redis.get(`error_log:${errorId}`);
+            if (errorStr) {
+              const errorLog = JSON.parse(errorStr);
+
+              // Calculate time ago
+              const timeAgo = this.getTimeAgo(new Date(errorLog.timestamp));
+              errorLog.timeAgo = timeAgo;
+
+              return errorLog;
+            }
+            return null;
+          } catch (error) {
+            logger.warn(
+              "[Request Tracker] Failed to parse error log:",
+              error.message,
+            );
+            return null;
+          }
+        }),
+      );
+
+      // Filter out null values and return
+      return errorLogs.filter((log) => log !== null);
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to get error logs:", error);
+      return [];
+    }
+  }
+
+  // Clear all error logs
+  async clearErrorLogs() {
+    try {
+      // Get all error IDs from sorted set
+      const errorIds = await redis.zrange("error_logs", 0, -1);
+      
+      // Also scan for any orphaned error_log:* keys not in the sorted set
+      const orphanedKeys = [];
+      let cursor = '0';
+      do {
+        const [newCursor, keys] = await redis.scan(cursor, 'MATCH', 'error_log:*', 'COUNT', 100);
+        cursor = newCursor;
+        orphanedKeys.push(...keys);
+      } while (cursor !== '0');
+
+      // Combine both sets of keys to delete
+      const keysToDelete = new Set([
+        ...errorIds.map(id => `error_log:${id}`),
+        ...orphanedKeys
+      ]);
+
+      if (keysToDelete.size === 0 && errorIds.length === 0) {
+        return { success: true, message: "No error logs to clear", clearedCount: 0 };
+      }
+
+      // Delete all error log entries and the sorted set
+      const pipeline = redis.pipeline();
+      for (const key of keysToDelete) {
+        pipeline.del(key);
+      }
+      pipeline.del("error_logs");
+      await pipeline.exec();
+
+      const clearedCount = keysToDelete.size;
+      logger.info(`[Request Tracker] Cleared ${clearedCount} error logs`);
+      return { success: true, message: `Cleared ${clearedCount} error logs`, clearedCount };
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to clear error logs:", error);
+      return { success: false, message: error.message, clearedCount: 0 };
+    }
+  }
+
+  // Helper function to calculate time ago
+  getTimeAgo(date) {
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60)
+      return `${diffMins} minute${diffMins > 1 ? "s" : ""} ago`;
+    if (diffHours < 24)
+      return `${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
+    return `${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
+  }
+
+  // Get anonymized IP from request (helper method)
+  getAnonymizedIP(req) {
+    let anonymizedIP = "unknown";
+    try {
+      const ip =
+        req.ip ||
+        req.connection?.remoteAddress ||
+        req.socket?.remoteAddress ||
+        "unknown";
+      if (ip && ip !== "unknown") {
+        // For IPv4, keep first 3 octets (e.g., 192.168.1.x)
+        // For IPv6, keep first 3 groups (e.g., 2001:db8:85a3::x)
+        if (ip.includes(".")) {
+          const parts = ip.split(".");
+          anonymizedIP = parts.slice(0, 3).join(".") + ".x";
+        } else if (ip.includes(":")) {
+          const parts = ip.split(":");
+          anonymizedIP = parts.slice(0, 3).join(":") + "::x";
+        } else {
+          anonymizedIP = "unknown";
+        }
+      }
+    } catch (error) {
+      anonymizedIP = "unknown";
+    }
+    return anonymizedIP;
+  }
+
+  getImprovedUserIdentifier(req) {
+    const crypto = require("crypto");
+
+    const userUUID = req.params?.userUUID;
+    if (userUUID) {
+      return crypto
+        .createHash("sha256")
+        .update(userUUID)
+        .digest("hex")
+        .substring(0, 16);
+    }
+
+    const anonymizedIP = this.getAnonymizedIP(req);
+    const userAgent = req.get("User-Agent") || "unknown";
+    let browserType;
+    if (userAgent.includes("Chrome")) browserType = "chrome";
+    else if (userAgent.includes("Firefox")) browserType = "firefox";
+    else if (userAgent.includes("Safari")) browserType = "safari";
+    else if (userAgent.includes("Edge")) browserType = "edge";
+    else if (userAgent.includes("Stremio")) browserType = "stremio";
+    else browserType = "other";
+
+    const compositeId = `${anonymizedIP}:${browserType}`;
+
+    return crypto
+      .createHash("sha256")
+      .update(compositeId)
+      .digest("hex")
+      .substring(0, 16);
+  }
+
+  // Track active user with improved methodology
+  async trackActiveUser(userIdentifier, req) {
+    try {
+      const now = Date.now();
+      const today = new Date().toISOString().split("T")[0];
+
+      // Track in multiple time windows for better accuracy
+      const timeWindows = [
+        { key: `active_users:15min`, ttl: 900 }, // 15 minutes
+      ];
+
+      // Store detailed user activity for analytics
+      const userUUID = req.params?.userUUID;
+      const userActivity = {
+        identifier: userIdentifier,
+        displayName: userUUID ? userUUID.substring(0, 8) : null,
+        timestamp: now,
+        endpoint: this.normalizeEndpoint(req.path),
+        userAgent: req.get("User-Agent") || "unknown",
+        method: req.method,
+        anonymizedIP: this.getAnonymizedIP(req),
+      };
+
+      // Execute Redis operations in parallel
+      await Promise.all([
+        // Time window tracking
+        ...timeWindows.flatMap(window => [
+          redis.sadd(window.key, userIdentifier),
+          redis.expire(window.key, window.ttl)
+        ]),
+        // User activity tracking
+        redis.lpush("user_activities", JSON.stringify(userActivity)),
+        redis.ltrim("user_activities", 0, 999),
+        redis.expire("user_activities", 86400 * 7),
+      ]);
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to track active user:",
+        error.message,
+      );
+    }
+  }
+
+  // Get active users with improved methodology
+  async getActiveUsers(timeWindow = "15min") {
+    try {
+      const key = `active_users:${timeWindow}`;
+      const count = await redis.scard(key);
+      return count || 0;
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to get active users:",
+        error.message,
+      );
+      return 0;
+    }
+  }
+
+  // Clear inflated active user data (run once to reset after fixing the ID logic)
+  async clearActiveUserData() {
+    try {
+      const patterns = [
+        "active_users:*",
+        "unique_users:*", 
+        "user_activities"
+      ];
+
+      const { deleteKeysByPattern } = require('./redisUtils');
+      for (const pattern of patterns) {
+        const deleted = await deleteKeysByPattern(pattern);
+        if (deleted > 0) {
+          logger.info(`[Request Tracker] Cleared ${deleted} keys matching ${pattern}`);
+        }
+      }
+
+      logger.info("[Request Tracker] Active user data cleared - new tracking will be more accurate");
+      return { success: true, message: "Active user data cleared successfully" };
+    } catch (error) {
+      logger.error("[Request Tracker] Failed to clear active user data:", error);
+      return { success: false, message: error.message };
+    }
+  }
+
+  // Get recent user activities for analytics
+  async getRecentUserActivities(limit = 50) {
+    try {
+      const activities = await redis.lrange("user_activities", 0, limit - 1);
+      return activities
+        .map((activity) => {
+          try {
+            return JSON.parse(activity);
+          } catch (error) {
+            return null;
+          }
+        })
+        .filter((activity) => activity !== null);
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to get recent user activities:",
+        error.message,
+      );
+      return [];
+    }
+  }
+
+  // Clean up corrupted Redis keys that might cause WRONGTYPE errors
+  async cleanupCorruptedKeys() {
+    try {
+      const providers = [
+        "tmdb",
+        "tvdb",
+        "mal",
+        "anilist",
+        "kitsu",
+        "fanart",
+        "tvmaze",
+      ];
+      const today = new Date().toISOString().split("T")[0];
+
+      for (const provider of providers) {
+        // Check for daily keys that should be hourly
+        const dailyKey = `provider_response_times:${provider}:${today}`;
+        try {
+          const keyType = await redis.type(dailyKey);
+          if (keyType !== "none" && keyType !== "list") {
+            logger.info(
+              `[Request Tracker] Cleaning up corrupted key: ${dailyKey} (type: ${keyType})`,
+            );
+            await redis.del(dailyKey);
+          }
+        } catch (error) {
+          logger.warn(
+            `[Request Tracker] Failed to check/clean key ${dailyKey}:`,
+            error.message,
+          );
+        }
+      }
+
+      logger.info("[Request Tracker] Corrupted key cleanup completed");
+    } catch (error) {
+      logger.warn(
+        "[Request Tracker] Failed to cleanup corrupted keys:",
+        error.message,
+      );
+    }
+  }
+}
+
+module.exports = new RequestTracker();
