@@ -396,7 +396,6 @@ async function getEmbySeriesStream(session: EmbySession, id: string, config: any
 
   const episodes = await getSeriesEpisodes(session, series.Id);
   const episode = episodes.find((candidate) =>
-    candidate.SeriesId === series.Id &&
     candidate.ParentIndexNumber === parsed.season &&
     candidate.IndexNumber === parsed.episode
   );
