@@ -54,6 +54,13 @@ const { getRpdbPoster, getRatingPosterUrl, parseAnimeCatalogMeta, parseAnimeCata
 const { getFavorites, getWatchList } = require("./lib/getPersonalLists");
 const { resolveDynamicTmdbDiscoverParams } = require('./lib/tmdbDiscoverDateTokens');
 const { blurImage, convertBannerToBackground } = require('./utils/imageProcessor');
+const {
+  addBadgeToPosterUrl,
+  buildBadgePosterProxyUrl,
+  getPosterBadgeType,
+  normalizePosterBadgeType,
+  pipePosterImageResponseWithBadge,
+} = require('./utils/posterBadges');
 const { TraktClient } = require('./lib/trakt');
 const { SimklClient } = require('./lib/simkl');
 const axios = require('axios');
@@ -3907,6 +3914,38 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       }
     }
 
+    if (cleanId.startsWith('merged.') && responseData?.metas && Array.isArray(responseData.metas)) {
+      responseData = {
+        ...responseData,
+        metas: responseData.metas.map((meta) => {
+          const decoratedMeta = meta && typeof meta === 'object' ? { ...meta } : meta;
+          if (!decoratedMeta || typeof decoratedMeta !== 'object') return decoratedMeta;
+
+          const badgeType = getPosterBadgeType(decoratedMeta, actualType);
+          if (!badgeType || !decoratedMeta.poster) return decoratedMeta;
+
+          if (typeof decoratedMeta.poster === 'string' && decoratedMeta.poster.includes('/poster/')) {
+            decoratedMeta.poster = addBadgeToPosterUrl(decoratedMeta.poster, badgeType);
+            return decoratedMeta;
+          }
+
+          const ids = extractIdsFromMeta(decoratedMeta);
+          const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
+          if (!proxyId) return decoratedMeta;
+
+          decoratedMeta.poster = buildBadgePosterProxyUrl({
+            host,
+            type: badgeType,
+            proxyId,
+            fallback: decoratedMeta.poster,
+            badgeType,
+            language: config.language || 'en-US',
+          });
+          return decoratedMeta;
+        }),
+      };
+    }
+
     const httpCacheOpts = { cacheMaxAge: 0, staleRevalidate: 5 * 60 }; // No cache for regular catalogs, 5 min stale-while-revalidate
     respond(req, res, responseData, httpCacheOpts);
 
@@ -4611,11 +4650,12 @@ function pipePosterImageResponse(res, imageResponse) {
 
 addon.get("/poster/:type/:id", async function (req, res) {
   const { type, id } = req.params;
-  const { fallback, lang, key, url: customUrl } = req.query;
-  if (!key && !customUrl) {
-    return res.redirect(302, fallback);
+  const { fallback, lang, key, url: customUrl, badge } = req.query;
+  const badgeType = normalizePosterBadgeType(badge);
+  if (!key && !customUrl && !badgeType) {
+    return fallback ? res.redirect(302, fallback) : res.status(404).end();
   }
-  const etag = crypto.createHash('md5').update(`${type}:${id}:${customUrl || key}:${lang}`).digest('hex');
+  const etag = crypto.createHash('md5').update(`${type}:${id}:${customUrl || key}:${lang}:${fallback || ''}:${badgeType || ''}`).digest('hex');
   res.setHeader('ETag', `"${etag}"`);
   if (req.headers['if-none-match'] === `"${etag}"`) {
     return res.status(304).end();
@@ -4623,6 +4663,10 @@ addon.get("/poster/:type/:id", async function (req, res) {
 
   try {
     let posterUrl = customUrl || null;
+
+    if (!posterUrl && badgeType && fallback && !key) {
+      posterUrl = fallback;
+    }
 
     if (!posterUrl) {
       const [idSource, idValue] = id.startsWith('tt') ? ['imdb', id] : id.split(':');
@@ -4641,10 +4685,13 @@ addon.get("/poster/:type/:id", async function (req, res) {
     }
 
     if (!posterUrl) {
-      return res.redirect(302, fallback);
+      return fallback ? res.redirect(302, fallback) : res.status(404).end();
     }
 
     const imageResponse = await fetchPosterImageStream(posterUrl);
+    if (badgeType) {
+      return await pipePosterImageResponseWithBadge(res, imageResponse, badgeType);
+    }
     pipePosterImageResponse(res, imageResponse);
   } catch (error) {
     const isTimeout = error.code === 'ECONNABORTED' || /timeout/i.test(error.message || '');
@@ -4653,7 +4700,7 @@ addon.get("/poster/:type/:id", async function (req, res) {
     } else {
       consola.error(`Error in poster proxy for ${id}:`, error.message);
     }
-    res.redirect(302, fallback);
+    return fallback ? res.redirect(302, fallback) : res.status(502).end();
   }
 });
 
