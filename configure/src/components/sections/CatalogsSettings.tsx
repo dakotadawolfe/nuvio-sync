@@ -1863,6 +1863,7 @@ const MergedCatalogCard = ({
   const [newType, setNewType] = useState(catalog.displayType || catalog.type);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsMergeMode, setSettingsMergeMode] = useState<'interleaved' | 'sequential' | 'alternating'>(catalog.metadata?.mergeMode || 'interleaved');
+  const [settingsHideWatchedTrakt, setSettingsHideWatchedTrakt] = useState<string>(catalog.metadata?.hideWatchedTrakt === true ? 'on' : catalog.metadata?.hideWatchedTrakt === false ? 'off' : 'global');
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -1897,6 +1898,12 @@ const MergedCatalogCard = ({
 
   const handleToggleRandomize = () => {
     updateCatalog(c => ({ ...c, randomizePerPage: !c.randomizePerPage }));
+  };
+
+  const handleOpenSettings = () => {
+    setSettingsMergeMode(catalog.metadata?.mergeMode || 'interleaved');
+    setSettingsHideWatchedTrakt(catalog.metadata?.hideWatchedTrakt === true ? 'on' : catalog.metadata?.hideWatchedTrakt === false ? 'off' : 'global');
+    setShowSettings(true);
   };
 
   const handleEditSave = () => {
@@ -2047,7 +2054,7 @@ const MergedCatalogCard = ({
                         <Shuffle className={`h-4 w-4 mr-2 ${catalog.randomizePerPage && catalog.enabled ? 'text-purple-400' : 'text-muted-foreground'}`} />
                         {catalog.randomizePerPage ? 'Original Order' : 'Randomize Order'}
                       </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => { setSettingsMergeMode(catalog.metadata?.mergeMode || 'interleaved'); setShowSettings(true); }}>
+                      <DropdownMenuItem onClick={handleOpenSettings}>
                         <Settings className="h-4 w-4 mr-2 text-muted-foreground" />
                         Merge Settings
                       </DropdownMenuItem>
@@ -2148,7 +2155,7 @@ const MergedCatalogCard = ({
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" onClick={() => { setSettingsMergeMode(catalog.metadata?.mergeMode || 'interleaved'); setShowSettings(true); }} className="h-8 w-8 active:scale-90 transition-transform">
+                <Button variant="ghost" size="icon" onClick={handleOpenSettings} className="h-8 w-8 active:scale-90 transition-transform">
                   <Settings className="h-5 w-5 text-muted-foreground hover:text-foreground" />
                 </Button>
               </TooltipTrigger>
@@ -2231,10 +2238,26 @@ const MergedCatalogCard = ({
                 </SelectContent>
               </Select>
             </div>
+            {config.apiKeys?.traktTokenId && (
+              <div className="space-y-2">
+                <Label>Hide Trakt Watched Items</Label>
+                <Select value={settingsHideWatchedTrakt} onValueChange={setSettingsHideWatchedTrakt}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="global">Use Global Setting</SelectItem>
+                    <SelectItem value="on">Always On</SelectItem>
+                    <SelectItem value="off">Always Off</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={() => setShowSettings(false)}>Cancel</Button>
               <Button onClick={() => {
-                updateCatalog(c => ({ ...c, metadata: { ...c.metadata, mergeMode: settingsMergeMode } }));
+                const hideTraktValue = settingsHideWatchedTrakt === 'on' ? true : settingsHideWatchedTrakt === 'off' ? false : undefined;
+                updateCatalog(c => ({ ...c, metadata: { ...c.metadata, mergeMode: settingsMergeMode, hideWatchedTrakt: hideTraktValue } }));
                 setShowSettings(false);
               }}>Save</Button>
             </div>
