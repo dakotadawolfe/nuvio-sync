@@ -1,0 +1,577 @@
+const assert = require('node:assert/strict');
+const { PassThrough, Readable } = require('node:stream');
+const Module = require('node:module');
+const path = require('node:path');
+const test = require('node:test');
+
+const embyModulePath = path.resolve(__dirname, '../dist/server/lib/embyStreams.js');
+
+function loadEmbyStreamsWithMocks({ httpGet, httpPost, undiciRequest } = {}) {
+  delete require.cache[embyModulePath];
+
+  const originalLoad = Module._load;
+  Module._load = function mockedLoad(request, parent, isMain) {
+    if (request === 'undici' && undiciRequest) {
+      return {
+        request: undiciRequest,
+      };
+    }
+    if (request === '../utils/httpClient') {
+      return {
+        httpGet: httpGet || (async () => ({ data: {} })),
+        httpPost: httpPost || (async () => ({ data: {} })),
+      };
+    }
+    if (request === './id-resolver') {
+      return {
+        resolveAllIds: async () => ({ imdbId: 'tt1234567' }),
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+
+  try {
+    return require(embyModulePath);
+  } finally {
+    Module._load = originalLoad;
+  }
+}
+
+async function withEnv(updates, fn) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(updates)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+function makePlaybackInfo(overrides = {}) {
+  return {
+    PlaySessionId: 'play-session-1',
+    MediaSources: [
+      {
+        Id: 'media-source-1',
+        Protocol: 'File',
+        Container: 'mkv',
+        SupportsDirectPlay: true,
+        SupportsDirectStream: false,
+        Bitrate: 10_400_000,
+        Size: 1_234_567_890,
+        Path: '/server/movies/Problem Movie.mkv',
+        RunTimeTicks: 7_200_000_000,
+        MediaStreams: [
+          { Type: 'Video', Codec: 'hevc', Index: 0 },
+          { Type: 'Audio', Codec: 'aac', Index: 1 },
+          { Type: 'Subtitle', Codec: 'srt', Index: 2 },
+        ],
+        ...overrides,
+      },
+    ],
+  };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function makeWritableResponse() {
+  const res = new PassThrough();
+  res.headers = {};
+  res.statusCode = null;
+  res.status = function status(code) {
+    this.statusCode = code;
+    return this;
+  };
+  res.setHeader = function setHeader(key, value) {
+    this.headers[key.toLowerCase()] = value;
+    return this;
+  };
+  return res;
+}
+
+test('getEmbyStreams calls PlaybackInfo and builds a Direct Play URL with MediaSourceId and PlaySessionId', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+    const calls = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        const parsed = new URL(url);
+        calls.push(parsed);
+
+        if (parsed.pathname === '/Users/user-1/Items') {
+          return { data: { Items: [{ Id: 'item-1', Name: 'Problem Movie' }] } };
+        }
+        if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
+          return { data: makePlaybackInfo() };
+        }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+    });
+
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      userUUID: 'user-uuid-1',
+      apiKeys: {
+        embyServer: 'https://emby.example',
+        embyUserId: 'user-1',
+        embyAccessToken: 'token-abc',
+      },
+    });
+
+    assert.equal(result.streams.length, 1);
+    assert.ok(calls.some((call) => call.pathname === '/Items/item-1/PlaybackInfo'));
+
+    const stream = result.streams[0];
+    const streamUrl = new URL(stream.url);
+    assert.equal(streamUrl.pathname, '/Videos/item-1/stream.mkv');
+    assert.equal(streamUrl.searchParams.get('static'), 'true');
+    assert.equal(streamUrl.searchParams.get('MediaSourceId'), 'media-source-1');
+    assert.equal(streamUrl.searchParams.get('PlaySessionId'), 'play-session-1');
+    assert.equal(streamUrl.searchParams.get('api_key'), 'token-abc');
+    assert.equal(stream.behaviorHints.notWebReady, true);
+    assert.equal(stream.behaviorHints.filename, 'Problem Movie.mkv');
+    assert.equal(stream.behaviorHints.videoSize, 1_234_567_890);
+    assert.match(stream.behaviorHints.bingeGroup, /^emby-directplay-mkv-/);
+    assert.match(stream.description, /Direct Play/);
+    assert.doesNotMatch(stream.title, /\/server\/movies/);
+  });
+});
+
+test('web-readiness hints only mark HTTPS MP4 and M4V streams ready', () => {
+  const emby = loadEmbyStreamsWithMocks();
+
+  assert.equal(emby.isWebReadyDirectPlay({ serverUrl: 'https://emby.example', container: 'mp4' }), true);
+  assert.equal(emby.isWebReadyDirectPlay({ serverUrl: 'https://emby.example', container: 'm4v' }), true);
+  assert.equal(emby.isWebReadyDirectPlay({ serverUrl: 'http://emby.example', container: 'mp4' }), false);
+  assert.equal(emby.isWebReadyDirectPlay({ serverUrl: 'https://emby.example', container: 'mkv' }), false);
+});
+
+test('stream extension mapping covers Direct Play containers and fallback stream paths', () => {
+  const emby = loadEmbyStreamsWithMocks();
+
+  assert.equal(emby.getStreamExtension('mp4'), 'mp4');
+  assert.equal(emby.getStreamExtension('m4v'), 'm4v');
+  assert.equal(emby.getStreamExtension('mkv'), 'mkv');
+  assert.equal(emby.getStreamExtension('matroska'), 'mkv');
+  assert.equal(emby.getStreamExtension('ts'), 'ts');
+  assert.equal(emby.getStreamExtension('mpegts'), 'ts');
+  assert.equal(emby.getStreamExtension('m2ts'), 'm2ts');
+  assert.equal(emby.getStreamExtension('webm'), 'webm');
+  assert.equal(emby.getStreamExtension('unknown-container'), '');
+
+  const staticUrl = new URL(emby.buildStaticStreamUrl(
+    { serverUrl: 'https://emby.example', accessToken: 'token-abc', userId: 'user-1' },
+    'item-1',
+    { Id: 'media-source-1', Container: 'unknown-container' },
+    'play-session-1'
+  ));
+  assert.equal(staticUrl.pathname, '/Videos/item-1/stream');
+  assert.equal(staticUrl.searchParams.get('MediaSourceId'), 'media-source-1');
+  assert.equal(staticUrl.searchParams.get('PlaySessionId'), 'play-session-1');
+});
+
+test('Direct Play media source selection skips unsupported and RTMP sources without requiring Direct Stream', () => {
+  const emby = loadEmbyStreamsWithMocks();
+
+  const selected = emby.selectDirectPlayableSource([
+    { Id: 'unsupported', Protocol: 'File', Container: 'mp4', SupportsDirectPlay: false },
+    { Id: 'rtmp-source', Protocol: 'rtmp', Container: 'mkv', SupportsDirectPlay: true },
+    { Id: 'direct-play-source', Protocol: 'File', Container: 'webm', SupportsDirectPlay: true, SupportsDirectStream: false },
+  ]);
+
+  assert.equal(selected.Id, 'direct-play-source');
+});
+
+test('DeviceId is deterministic per Emby server, user id, and addon user UUID', () => {
+  const emby = loadEmbyStreamsWithMocks();
+
+  const first = emby.getEmbyDeviceId({
+    serverUrl: 'https://emby.example',
+    userId: 'emby-user-1',
+    userUUID: 'addon-user-1',
+  });
+  const second = emby.getEmbyDeviceId({
+    serverUrl: 'https://emby.example/',
+    userId: 'emby-user-1',
+    userUUID: 'addon-user-1',
+  });
+  const different = emby.getEmbyDeviceId({
+    serverUrl: 'https://emby.example',
+    userId: 'emby-user-1',
+    userUUID: 'addon-user-2',
+  });
+
+  assert.equal(first, second);
+  assert.match(first, /^aio-addon-[a-f0-9]{32}$/);
+  assert.notEqual(first, different);
+  assert.match(emby.buildEmbyAuthorizationHeader({
+    serverUrl: 'https://emby.example',
+    userId: 'emby-user-1',
+    userUUID: 'addon-user-1',
+  }), new RegExp(`DeviceId="${first}"`));
+});
+
+test('legacy saved Emby config shape still generates streams without new optional fields', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        const parsed = new URL(url);
+        if (parsed.pathname === '/Users/user-1/Items') {
+          return { data: { Items: [{ Id: 'item-1', Name: 'Legacy Config Movie' }] } };
+        }
+        if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
+          return { data: { MediaSources: makePlaybackInfo({ Container: 'm4v' }).MediaSources } };
+        }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+    });
+
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      emby: {
+        serverUrl: 'https://emby.example',
+        userId: 'user-1',
+        accessToken: 'token-abc',
+      },
+    });
+
+    assert.equal(result.streams.length, 1);
+    const streamUrl = new URL(result.streams[0].url);
+    assert.equal(streamUrl.pathname, '/Videos/item-1/stream.m4v');
+    assert.equal(streamUrl.searchParams.get('api_key'), 'token-abc');
+    assert.match(streamUrl.searchParams.get('PlaySessionId'), /^addon-/);
+  });
+});
+
+test('default redirect mode returns a signed addon URL without exposing Emby tokens', async () => {
+  await withEnv({
+    HOST_NAME: 'https://addon.example',
+    EMBY_STREAM_PROXY_MODE: undefined,
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+  }, async () => {
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        const parsed = new URL(url);
+        if (parsed.pathname === '/Users/user-1/Items') {
+          return { data: { Items: [{ Id: 'item-1', Name: 'Problem MP4' }] } };
+        }
+        if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
+          return { data: makePlaybackInfo({ Container: 'mp4', Path: '/server/movies/Problem MP4.mp4' }) };
+        }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+    });
+
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      userUUID: 'addon-user-1',
+      apiKeys: {
+        embyServer: 'https://emby.example',
+        embyUserId: 'user-1',
+        embyAccessToken: 'token-abc',
+      },
+    });
+
+    assert.equal(result.streams.length, 1);
+    const streamUrl = new URL(result.streams[0].url);
+    assert.equal(streamUrl.origin, 'https://addon.example');
+    assert.match(streamUrl.pathname, /^\/emby\/play\/[^/]+\/stream\.mp4$/);
+    assert.doesNotMatch(result.streams[0].url, /token-abc|api_key|media-source-1|play-session-1/);
+
+    const signedToken = streamUrl.pathname.split('/')[3];
+    const payload = emby.verifySignedEmbyStreamToken(signedToken);
+    assert.equal(payload.userUUID, 'addon-user-1');
+    assert.equal(payload.itemId, 'item-1');
+    assert.equal(payload.mediaSourceId, 'media-source-1');
+    assert.equal(payload.playSessionId, 'play-session-1');
+    assert.equal(payload.container, 'mp4');
+  });
+});
+
+test('signed playback route reports Sessions/Playing and redirects to final static Emby URL', async () => {
+  await withEnv({
+    EMBY_STREAM_PROXY_MODE: 'redirect',
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+  }, async () => {
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async (url, body, options) => {
+        posts.push({ url: new URL(url), body, options });
+        return { data: {}, status: 204 };
+      },
+    });
+
+    const signedToken = emby.signEmbyStreamToken({
+      userUUID: 'addon-user-1',
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-1',
+      playSessionId: 'play-session-1',
+      container: 'mkv',
+      ext: 'mkv',
+      audioStreamIndex: 1,
+      expiresAt: Date.now() + 60_000,
+    });
+    const res = {
+      statusCode: null,
+      jsonBody: null,
+      redirectCode: null,
+      redirectUrl: null,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        this.jsonBody = body;
+        return this;
+      },
+      redirect(code, url) {
+        this.redirectCode = code;
+        this.redirectUrl = url;
+        return this;
+      },
+    };
+
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: {} },
+      res,
+      async (userUUID) => {
+        assert.equal(userUUID, 'addon-user-1');
+        return {
+          apiKeys: {
+            embyServer: 'https://emby.example',
+            embyUserId: 'user-1',
+            embyAccessToken: 'token-abc',
+          },
+        };
+      }
+    );
+
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url.pathname, '/Sessions/Playing');
+    assert.equal(posts[0].url.searchParams.get('api_key'), 'token-abc');
+    assert.equal(posts[0].body.ItemId, 'item-1');
+    assert.equal(posts[0].body.MediaSourceId, 'media-source-1');
+    assert.equal(posts[0].body.PlaySessionId, 'play-session-1');
+    assert.equal(posts[0].body.PlayMethod, 'DirectPlay');
+    assert.equal(posts[0].body.AudioStreamIndex, 1);
+    assert.match(posts[0].options.headers['X-Emby-Authorization'], /DeviceId="aio-addon-[a-f0-9]{32}"/);
+
+    assert.equal(res.redirectCode, 302);
+    const redirectUrl = new URL(res.redirectUrl);
+    assert.equal(redirectUrl.pathname, '/Videos/item-1/stream.mkv');
+    assert.equal(redirectUrl.searchParams.get('static'), 'true');
+    assert.equal(redirectUrl.searchParams.get('MediaSourceId'), 'media-source-1');
+    assert.equal(redirectUrl.searchParams.get('PlaySessionId'), 'play-session-1');
+    assert.equal(redirectUrl.searchParams.get('api_key'), 'token-abc');
+  });
+});
+
+test('playback progress helper posts DirectPlay progress payload with position and event name', async () => {
+  const posts = [];
+  const emby = loadEmbyStreamsWithMocks({
+    httpPost: async (url, body, options) => {
+      posts.push({ url: new URL(url), body, options });
+      return { data: {}, status: 204 };
+    },
+  });
+
+  await emby.reportPlaybackProgress(
+    {
+      serverUrl: 'https://emby.example',
+      accessToken: 'token-abc',
+      userId: 'user-1',
+      userUUID: 'addon-user-1',
+    },
+    {
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-1',
+      playSessionId: 'play-session-1',
+      container: 'mp4',
+      ext: 'mp4',
+      audioStreamIndex: 1,
+      subtitleStreamIndex: 3,
+      expiresAt: Date.now() + 60_000,
+    },
+    {
+      positionTicks: 12_345,
+      IsPaused: true,
+      EventName: 'Pause',
+    }
+  );
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url.pathname, '/Sessions/Playing/Progress');
+  assert.equal(posts[0].body.ItemId, 'item-1');
+  assert.equal(posts[0].body.MediaSourceId, 'media-source-1');
+  assert.equal(posts[0].body.PlaySessionId, 'play-session-1');
+  assert.equal(posts[0].body.PositionTicks, 12_345);
+  assert.equal(posts[0].body.IsPaused, true);
+  assert.equal(posts[0].body.EventName, 'Pause');
+  assert.equal(posts[0].body.PlayMethod, 'DirectPlay');
+  assert.equal(posts[0].body.AudioStreamIndex, 1);
+  assert.equal(posts[0].body.SubtitleStreamIndex, 3);
+  assert.equal(posts[0].url.searchParams.get('api_key'), 'token-abc');
+});
+
+test('proxy mode preserves range headers and cancels false stopped events across range switches', async () => {
+  await withEnv({
+    EMBY_STREAM_PROXY_MODE: 'proxy',
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+    EMBY_STREAM_STOP_DEBOUNCE_MS: '25',
+  }, async () => {
+    const posts = [];
+    const proxyRequests = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async (url, body, options) => {
+        posts.push({ url: new URL(url), body, options });
+        return { data: {}, status: 204 };
+      },
+      undiciRequest: async (url, options) => {
+        proxyRequests.push({ url: new URL(url), options });
+        return {
+          statusCode: 206,
+          headers: {
+            'content-range': 'bytes 0-1023/2048',
+            'accept-ranges': 'bytes',
+            'content-length': '1024',
+            'content-type': 'video/x-matroska',
+            etag: '"abc"',
+            'last-modified': 'Wed, 01 Jul 2026 12:00:00 GMT',
+          },
+          body: Readable.from(['video-bytes']),
+        };
+      },
+    });
+
+    const signedToken = emby.signEmbyStreamToken({
+      userUUID: 'addon-user-1',
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-1',
+      playSessionId: 'play-session-1',
+      container: 'mkv',
+      ext: 'mkv',
+      expiresAt: Date.now() + 60_000,
+    });
+    const loadConfigFromDatabase = async (userUUID) => {
+      assert.equal(userUUID, 'addon-user-1');
+      return {
+        apiKeys: {
+          embyServer: 'https://emby.example',
+          embyUserId: 'user-1',
+          embyAccessToken: 'token-abc',
+        },
+      };
+    };
+
+    const firstRes = makeWritableResponse();
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: { range: 'bytes=0-1023' } },
+      firstRes,
+      loadConfigFromDatabase
+    );
+    assert.equal(proxyRequests[0].options.headers.Range, 'bytes=0-1023');
+    assert.equal(firstRes.statusCode, 206);
+    assert.equal(firstRes.headers['content-range'], 'bytes 0-1023/2048');
+    assert.equal(firstRes.headers['accept-ranges'], 'bytes');
+    firstRes.emit('close');
+
+    const secondRes = makeWritableResponse();
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: { range: 'bytes=1024-2047' } },
+      secondRes,
+      loadConfigFromDatabase
+    );
+    assert.equal(proxyRequests[1].options.headers.Range, 'bytes=1024-2047');
+
+    await wait(50);
+    assert.equal(posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped').length, 0);
+
+    secondRes.emit('close');
+    await wait(50);
+
+    const stoppedPosts = posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped');
+    assert.equal(stoppedPosts.length, 1);
+    assert.equal(stoppedPosts[0].body.ItemId, 'item-1');
+    assert.equal(stoppedPosts[0].body.MediaSourceId, 'media-source-1');
+    assert.equal(stoppedPosts[0].body.PlaySessionId, 'play-session-1');
+    assert.equal(posts.filter((post) => post.url.pathname === '/Sessions/Playing').length, 2);
+  });
+});
+
+test('proxy mode follows upstream redirects while preserving Range', async () => {
+  await withEnv({
+    EMBY_STREAM_PROXY_MODE: 'proxy',
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+  }, async () => {
+    const proxyRequests = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async () => ({ data: {}, status: 204 }),
+      undiciRequest: async (url, options) => {
+        const parsed = new URL(url);
+        proxyRequests.push({ url: parsed, options });
+        if (proxyRequests.length === 1) {
+          return {
+            statusCode: 302,
+            headers: {
+              location: '/redirected-media/item-1.mkv?token=server-side',
+            },
+            body: Readable.from([]),
+          };
+        }
+        return {
+          statusCode: 206,
+          headers: {
+            'content-range': 'bytes 0-1023/4096',
+            'accept-ranges': 'bytes',
+            'content-length': '1024',
+            'content-type': 'video/x-matroska',
+          },
+          body: Readable.from(['redirected-video-bytes']),
+        };
+      },
+    });
+
+    const signedToken = emby.signEmbyStreamToken({
+      userUUID: 'addon-user-1',
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-1',
+      playSessionId: 'play-session-1',
+      container: 'mkv',
+      ext: 'mkv',
+      expiresAt: Date.now() + 60_000,
+    });
+    const res = makeWritableResponse();
+
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: { range: 'bytes=0-1023' } },
+      res,
+      async () => ({
+        apiKeys: {
+          embyServer: 'https://emby.example',
+          embyUserId: 'user-1',
+          embyAccessToken: 'token-abc',
+        },
+      })
+    );
+
+    assert.equal(proxyRequests.length, 2);
+    assert.equal(proxyRequests[0].url.pathname, '/Videos/item-1/stream.mkv');
+    assert.equal(proxyRequests[0].options.headers.Range, 'bytes=0-1023');
+    assert.equal(proxyRequests[1].url.href, 'https://emby.example/redirected-media/item-1.mkv?token=server-side');
+    assert.equal(proxyRequests[1].options.headers.Range, 'bytes=0-1023');
+    assert.equal(res.statusCode, 206);
+    assert.equal(res.headers['content-range'], 'bytes 0-1023/4096');
+  });
+});

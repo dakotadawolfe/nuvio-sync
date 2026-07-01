@@ -4188,6 +4188,12 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
   }
 });
 
+// --- Signed Emby playback handoff route ---
+addon.get(["/emby/play/:signedToken/stream", "/emby/play/:signedToken/stream.:ext"], async function (req, res) {
+  const { handleSignedEmbyStreamRequest } = require('./lib/embyStreams');
+  return handleSignedEmbyStreamRequest(req, res, loadConfigFromDatabase);
+});
+
 // --- Stream route for Emby direct playback and optional rating page ---
 addon.get("/stremio/:userUUID/stream/:type/:id.json", async function (req, res) {
   const { userUUID, type, id } = req.params;
@@ -4199,7 +4205,7 @@ addon.get("/stremio/:userUUID/stream/:type/:id.json", async function (req, res) 
     }
 
     const { getEmbyStreams } = require('./lib/embyStreams');
-    const embyResult = await getEmbyStreams(type, id, config);
+    const embyResult = await getEmbyStreams(type, id, { ...config, userUUID });
     const streams = [...(embyResult.streams || [])];
 
     consola.debug(`[Stream Route] Showing rate me button: ${config.showRateMeButton}, id: ${id}`);

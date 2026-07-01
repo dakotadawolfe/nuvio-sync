@@ -23,6 +23,7 @@
     "lint:backend": "eslint addon scripts",
     "lint:frontend": "eslint configure/src",
     "lint:repo": "eslint eslint.config.js tailwind.config.mts vite.config.mts",
+    "test:backend": "npm run build:backend && node --test tests/embyStreams.test.js",
     "test:poster-badges": "node scripts/test-poster-badges.js",
     "preview": "vite preview",
     "start": "npm run start:backend"

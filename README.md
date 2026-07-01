@@ -72,3 +72,33 @@ npm run start:backend
 ```
 
 The backend requires `DATABASE_URI` in the environment.
+
+## Emby Direct Play
+
+Emby streams are generated through `/Items/{Id}/PlaybackInfo` before the addon returns a Stremio stream. The selected Direct Play media source is used to build a static Emby URL with `MediaSourceId`, `PlaySessionId`, `static=true`, the existing saved Emby access token, and a container-specific path such as `stream.mkv` or `stream.mp4`.
+
+Existing Emby users do not need to reauthenticate. The addon still reads the saved `apiKeys.embyServer`, `apiKeys.embyUserId`, and `apiKeys.embyAccessToken` fields.
+
+Playback handoff defaults to signed redirect mode:
+
+```bash
+EMBY_STREAM_PROXY_MODE=redirect
+```
+
+Modes:
+
+- `redirect`: returns an addon-owned signed URL, reports `/Sessions/Playing` when Stremio/Nuvio requests it, then redirects to Emby.
+- `proxy`: uses the same signed URL, reports playback start, forwards `Range` requests and upstream `206`/range headers through the addon, and sends best-effort stopped reporting when the connection closes.
+- `off`: returns the direct Emby static URL without addon playback reporting.
+
+Optional diagnostics:
+
+```bash
+EMBY_DEBUG_PLAYBACK=true
+EMBY_STREAM_SIGNING_SECRET=replace-with-stable-server-secret
+EMBY_STREAM_STOP_DEBOUNCE_MS=1500
+```
+
+If `EMBY_STREAM_SIGNING_SECRET` is not set, the addon derives a stable signing secret from existing server-only secrets such as `ADDON_PASSWORD`, `ADMIN_KEY`, or `DATABASE_URI`. If none are available, only newly generated signed playback URLs expire on restart; saved Emby auth is not changed.
+
+Stremio direct URL playback does not expose full native player pause, seek, and stop callbacks to this addon. Redirect mode can reliably report playback start when the stream URL is requested. Proxy mode adds best-effort stopped reporting and range/response diagnostics, at the cost of routing video traffic through the addon server. Proxy mode follows upstream Emby redirects while preserving `Range` headers. `EMBY_STREAM_STOP_DEBOUNCE_MS` controls how long proxy mode waits before reporting stopped, which avoids false stops during byte-range switches. Progress reporting helpers exist for callback-capable flows, but the addon does not synthesize fake position updates when the player has not provided a real position.
