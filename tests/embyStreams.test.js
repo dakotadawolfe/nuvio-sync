@@ -130,6 +130,8 @@ test('getEmbyStreams calls PlaybackInfo and builds a Direct Play URL with MediaS
         embyUserId: 'user-1',
         embyAccessToken: 'token-abc',
       },
+      playbackClientId: 'client-hash-1',
+      playbackDeviceName: 'AIO Addon client-hash-1',
     });
 
     assert.equal(result.streams.length, 1);
@@ -282,6 +284,8 @@ test('default redirect mode returns a signed addon URL without exposing Emby tok
         embyUserId: 'user-1',
         embyAccessToken: 'token-abc',
       },
+      playbackClientId: 'client-hash-1',
+      playbackDeviceName: 'AIO Addon client-hash-1',
     });
 
     assert.equal(result.streams.length, 1);
@@ -297,6 +301,8 @@ test('default redirect mode returns a signed addon URL without exposing Emby tok
     assert.equal(payload.mediaSourceId, 'media-source-1');
     assert.equal(payload.playSessionId, 'play-session-1');
     assert.equal(payload.container, 'mp4');
+    assert.equal(payload.playbackClientId, 'client-hash-1');
+    assert.equal(payload.playbackDeviceName, 'AIO Addon client-hash-1');
   });
 });
 
@@ -378,6 +384,73 @@ test('signed playback route reports Sessions/Playing and redirects to final stat
   });
 });
 
+test('redirect mode keeps the Emby session active with a bounded progress heartbeat', async () => {
+  await withEnv({
+    EMBY_STREAM_PROXY_MODE: 'redirect',
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+    EMBY_PLAYBACK_PROGRESS_INTERVAL_MS: '20',
+    EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS: '75',
+  }, async () => {
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async (url, body, options) => {
+        posts.push({ url: new URL(url), body, options });
+        return { data: {}, status: 204 };
+      },
+    });
+
+    const signedToken = emby.signEmbyStreamToken({
+      userUUID: 'addon-user-1',
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-1',
+      playSessionId: 'play-session-1',
+      container: 'mkv',
+      ext: 'mkv',
+      expiresAt: Date.now() + 60_000,
+    });
+    const res = {
+      redirectCode: null,
+      redirectUrl: null,
+      redirect(code, url) {
+        this.redirectCode = code;
+        this.redirectUrl = url;
+        return this;
+      },
+      status() {
+        return this;
+      },
+      json() {
+        return this;
+      },
+    };
+
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: {} },
+      res,
+      async () => ({
+        apiKeys: {
+          embyServer: 'https://emby.example',
+          embyUserId: 'user-1',
+          embyAccessToken: 'token-abc',
+        },
+      })
+    );
+
+    assert.equal(res.redirectCode, 302);
+    await wait(60);
+
+    assert.equal(posts[0].url.pathname, '/Sessions/Playing');
+    const progressPosts = posts.filter((post) => post.url.pathname === '/Sessions/Playing/Progress');
+    assert.ok(progressPosts.length >= 1);
+    assert.equal(progressPosts[0].body.EventName, 'TimeUpdate');
+    assert.equal(progressPosts[0].body.PlayMethod, 'DirectPlay');
+
+    await wait(60);
+    const stoppedPosts = posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped');
+    assert.equal(stoppedPosts.length, 1);
+  });
+});
+
 test('playback progress helper posts DirectPlay progress payload with position and event name', async () => {
   const posts = [];
   const emby = loadEmbyStreamsWithMocks({
@@ -430,6 +503,7 @@ test('proxy mode preserves range headers and cancels false stopped events across
     EMBY_STREAM_PROXY_MODE: 'proxy',
     EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
     EMBY_STREAM_STOP_DEBOUNCE_MS: '25',
+    EMBY_PLAYBACK_PROGRESS_INTERVAL_MS: '20',
   }, async () => {
     const posts = [];
     const proxyRequests = [];
@@ -485,6 +559,8 @@ test('proxy mode preserves range headers and cancels false stopped events across
     assert.equal(firstRes.statusCode, 206);
     assert.equal(firstRes.headers['content-range'], 'bytes 0-1023/2048');
     assert.equal(firstRes.headers['accept-ranges'], 'bytes');
+    await wait(50);
+    assert.ok(posts.some((post) => post.url.pathname === '/Sessions/Playing/Progress'));
     firstRes.emit('close');
 
     const secondRes = makeWritableResponse();
@@ -508,6 +584,37 @@ test('proxy mode preserves range headers and cancels false stopped events across
     assert.equal(stoppedPosts[0].body.PlaySessionId, 'play-session-1');
     assert.equal(posts.filter((post) => post.url.pathname === '/Sessions/Playing').length, 2);
   });
+});
+
+test('request-derived playback client identity separates Emby DeviceIds without storing raw request data', () => {
+  const emby = loadEmbyStreamsWithMocks();
+
+  const firstClient = emby.getEmbyPlaybackClientFromRequest({
+    headers: {
+      'cf-connecting-ip': '203.0.113.10',
+      'user-agent': 'Nuvio Android TV/1.0',
+    },
+  });
+  const secondClient = emby.getEmbyPlaybackClientFromRequest({
+    headers: {
+      'cf-connecting-ip': '203.0.113.11',
+      'user-agent': 'Nuvio Android TV/1.0',
+    },
+  });
+
+  assert.ok(firstClient.playbackClientId);
+  assert.notEqual(firstClient.playbackClientId, secondClient.playbackClientId);
+  assert.doesNotMatch(JSON.stringify(firstClient), /203\.0\.113\.10|Nuvio Android TV/);
+
+  const base = {
+    serverUrl: 'https://emby.example',
+    userId: 'user-1',
+    userUUID: 'addon-user-1',
+  };
+  assert.notEqual(
+    emby.getEmbyDeviceId({ ...base, playbackClientId: firstClient.playbackClientId }),
+    emby.getEmbyDeviceId({ ...base, playbackClientId: secondClient.playbackClientId })
+  );
 });
 
 test('proxy mode follows upstream redirects while preserving Range', async () => {

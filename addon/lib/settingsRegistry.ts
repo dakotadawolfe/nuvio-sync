@@ -884,7 +884,7 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     key: 'EMBY_STREAM_PROXY_MODE',
     envVar: 'EMBY_STREAM_PROXY_MODE',
     label: 'Emby Stream Handoff',
-    description: 'How Emby Direct Play URLs are handed to Stremio/Nuvio: redirect signs addon URLs and reports playback start, proxy additionally forwards byte ranges through the addon, off returns direct Emby URLs.',
+    description: 'How Emby Direct Play URLs are handed to Stremio/Nuvio: redirect signs addon URLs, reports playback start, and runs a bounded heartbeat; proxy additionally forwards byte ranges through the addon; off returns direct Emby URLs.',
     category: 'Diagnostics',
     type: 'select',
     default: 'redirect',
@@ -917,6 +917,24 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     category: 'Diagnostics',
     type: 'number',
     default: 1500,
+  },
+  {
+    key: 'EMBY_PLAYBACK_PROGRESS_INTERVAL_MS',
+    envVar: 'EMBY_PLAYBACK_PROGRESS_INTERVAL_MS',
+    label: 'Emby Playback Heartbeat Interval (ms)',
+    description: 'Milliseconds between best-effort Emby /Sessions/Playing/Progress heartbeats while redirect or proxy playback is considered active.',
+    category: 'Diagnostics',
+    type: 'number',
+    default: 30000,
+  },
+  {
+    key: 'EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS',
+    envVar: 'EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS',
+    label: 'Emby Redirect Heartbeat Lease (seconds)',
+    description: 'Maximum seconds redirect mode keeps sending best-effort Emby progress heartbeats after handing the player a direct URL. Defaults to the signed stream token lifetime.',
+    category: 'Diagnostics',
+    type: 'number',
+    default: 21600,
   },
 
   // --- Server (bootstrap, env-only) ---

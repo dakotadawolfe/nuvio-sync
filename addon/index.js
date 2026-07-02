@@ -4204,8 +4204,12 @@ addon.get("/stremio/:userUUID/stream/:type/:id.json", async function (req, res) 
       return respond(req, res, { streams: [] }, { cacheMaxAge: 0 });
     }
 
-    const { getEmbyStreams } = require('./lib/embyStreams');
-    const embyResult = await getEmbyStreams(type, id, { ...config, userUUID });
+    const { getEmbyStreams, getEmbyPlaybackClientFromRequest } = require('./lib/embyStreams');
+    const embyResult = await getEmbyStreams(type, id, {
+      ...config,
+      userUUID,
+      ...getEmbyPlaybackClientFromRequest(req),
+    });
     const streams = [...(embyResult.streams || [])];
 
     consola.debug(`[Stream Route] Showing rate me button: ${config.showRateMeButton}, id: ${id}`);

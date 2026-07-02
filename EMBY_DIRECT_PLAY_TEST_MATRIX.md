@@ -9,6 +9,8 @@ Start with redirect mode:
 ```bash
 EMBY_STREAM_PROXY_MODE=redirect
 EMBY_DEBUG_PLAYBACK=true
+EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
+EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS=21600
 ```
 
 If redirect mode still buffers or range behavior is unclear, repeat the affected rows with:
@@ -17,6 +19,7 @@ If redirect mode still buffers or range behavior is unclear, repeat the affected
 EMBY_STREAM_PROXY_MODE=proxy
 EMBY_DEBUG_PLAYBACK=true
 EMBY_STREAM_STOP_DEBOUNCE_MS=1500
+EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 ```
 
 ## Matrix
@@ -49,6 +52,8 @@ EMBY_STREAM_STOP_DEBOUNCE_MS=1500
 - Whether Nuvio/Stremio requests byte ranges.
 - Whether Emby returns `200` or `206`.
 - Whether the Emby dashboard shows idle or active playback.
+- Whether Emby shows a distinct addon DeviceId/device entry for each Nuvio device.
+- Whether `/Sessions/Playing/Progress` succeeds after 5, 10, and 15 minutes.
 - Whether playback buffers repeatedly, stalls once, or stays smooth.
 
 ## Acceptance Notes

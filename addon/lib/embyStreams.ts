@@ -9,6 +9,14 @@ const logger: any = consola.withTag('EmbyStreams');
 const EMBY_TIMEOUT_MS = parsePositiveInt(process.env.EMBY_TIMEOUT_MS, 10000);
 const EMBY_ITEM_CACHE_TTL_MS = parsePositiveInt(process.env.EMBY_ITEM_CACHE_TTL_SECONDS, 5 * 60) * 1000;
 const EMBY_STREAM_TOKEN_TTL_MS = parsePositiveInt(process.env.EMBY_STREAM_TOKEN_TTL_SECONDS, 6 * 60 * 60) * 1000;
+const EMBY_PLAYBACK_PROGRESS_INTERVAL_MS = parsePositiveInt(process.env.EMBY_PLAYBACK_PROGRESS_INTERVAL_MS, 30_000);
+const EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS = parsePositiveInt(
+  process.env.EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
+  parsePositiveInt(
+    process.env.EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS,
+    parsePositiveInt(process.env.EMBY_STREAM_TOKEN_TTL_SECONDS, 6 * 60 * 60)
+  ) * 1000
+);
 const EMBY_APP_NAME = 'AIO Addon';
 
 const DEFAULT_FIELDS = [
@@ -38,12 +46,15 @@ const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
 const inMemorySigningSecret = crypto.randomBytes(32).toString('hex');
 let warnedEphemeralSigningSecret = false;
 const playbackStopDebounces = new Map<string, any>();
+const playbackProgressHeartbeats = new Map<string, { interval: any; timeout?: any }>();
 
 interface EmbyTokenConfig {
   serverUrl: string;
   accessToken: string;
   userId: string;
   userUUID?: string;
+  playbackClientId?: string;
+  playbackDeviceName?: string;
 }
 
 interface EmbySession {
@@ -51,6 +62,8 @@ interface EmbySession {
   accessToken: string;
   userId: string;
   userUUID?: string;
+  playbackClientId?: string;
+  playbackDeviceName?: string;
 }
 
 interface EmbyMediaStream {
@@ -119,6 +132,8 @@ interface SignedStreamPayload {
   ext: string;
   audioStreamIndex?: number;
   subtitleStreamIndex?: number;
+  playbackClientId?: string;
+  playbackDeviceName?: string;
   expiresAt: number;
 }
 
@@ -153,6 +168,53 @@ function setCached<T>(cache: Map<string, CachedValue<T>>, key: string, value: T,
 
 function hashCacheKey(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function firstHeaderValue(value: any): string {
+  if (Array.isArray(value)) {
+    return String(value[0] || '').trim();
+  }
+  return String(value || '').trim();
+}
+
+function getRequestHeader(req: any, name: string): string {
+  const headers = req?.headers || {};
+  return firstHeaderValue(headers[name] || headers[name.toLowerCase()]);
+}
+
+function firstForwardedAddress(value: string): string {
+  return String(value || '').split(',')[0].trim();
+}
+
+function getEmbyPlaybackClientFromRequest(req: any): { playbackClientId?: string; playbackDeviceName?: string } {
+  const address = firstForwardedAddress(
+    getRequestHeader(req, 'cf-connecting-ip') ||
+    getRequestHeader(req, 'x-real-ip') ||
+    getRequestHeader(req, 'x-forwarded-for') ||
+    req?.ip ||
+    req?.socket?.remoteAddress ||
+    req?.connection?.remoteAddress ||
+    ''
+  );
+  const userAgent = getRequestHeader(req, 'user-agent');
+  const platform = getRequestHeader(req, 'sec-ch-ua-platform');
+  const clientHint = getRequestHeader(req, 'x-stremio-client') || getRequestHeader(req, 'x-nuvio-client');
+  const fingerprintSource = [address, userAgent, platform, clientHint]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join('\0');
+
+  if (!fingerprintSource) {
+    return {};
+  }
+
+  const digest = crypto.createHash('sha256')
+    .update(fingerprintSource)
+    .digest('hex');
+  return {
+    playbackClientId: digest.slice(0, 32),
+    playbackDeviceName: `${EMBY_APP_NAME} ${digest.slice(0, 8)}`,
+  };
 }
 
 function normalizeBaseUrl(rawUrl: string): string {
@@ -203,21 +265,42 @@ function getAddonHost(): string | null {
   return host.startsWith('http://') || host.startsWith('https://') ? host.replace(/\/+$/, '') : `https://${host.replace(/\/+$/, '')}`;
 }
 
-function getEmbyDeviceId(input: { serverUrl?: string; userId?: string; userUUID?: string; userUuid?: string }): string {
+function sanitizeEmbyHeaderValue(value: string): string {
+  return String(value || '').replace(/["\r\n]/g, '').trim();
+}
+
+function getEmbyDeviceId(input: {
+  serverUrl?: string;
+  userId?: string;
+  userUUID?: string;
+  userUuid?: string;
+  playbackClientId?: string;
+  clientPlaybackId?: string;
+}): string {
   const serverUrl = normalizeBaseUrlForHash(input.serverUrl || '');
   const userId = String(input.userId || '').trim();
   const userUUID = String(input.userUUID || input.userUuid || userId || '').trim();
+  const playbackClientId = String(input.playbackClientId || input.clientPlaybackId || '').trim();
   const digest = crypto.createHash('sha256')
-    .update(`${serverUrl}\0${userId}\0${userUUID}`)
+    .update(`${serverUrl}\0${userId}\0${userUUID}\0${playbackClientId}`)
     .digest('hex')
     .slice(0, 32);
   return `aio-addon-${digest}`;
 }
 
-function buildEmbyAuthorizationHeader(input: { serverUrl?: string; userId?: string; userUUID?: string; userUuid?: string } = {}): string {
+function buildEmbyAuthorizationHeader(input: {
+  serverUrl?: string;
+  userId?: string;
+  userUUID?: string;
+  userUuid?: string;
+  playbackClientId?: string;
+  clientPlaybackId?: string;
+  playbackDeviceName?: string;
+} = {}): string {
   const version = String(buildInfo.version || '1.0.0').replace(/"/g, '');
   const deviceId = getEmbyDeviceId(input);
-  return `MediaBrowser Client="${EMBY_APP_NAME}", Device="${EMBY_APP_NAME}", DeviceId="${deviceId}", Version="${version}"`;
+  const deviceName = sanitizeEmbyHeaderValue(input.playbackDeviceName || EMBY_APP_NAME) || EMBY_APP_NAME;
+  return `MediaBrowser Client="${EMBY_APP_NAME}", Device="${deviceName}", DeviceId="${deviceId}", Version="${version}"`;
 }
 
 function authHeader(session?: Partial<EmbySession>): string {
@@ -323,6 +406,8 @@ function getEmbyTokenConfig(config: any): EmbyTokenConfig | null {
     accessToken: accessToken.trim(),
     userId: userId.trim(),
     userUUID: getConfigUserUUID(config),
+    playbackClientId: config?.playbackClientId,
+    playbackDeviceName: config?.playbackDeviceName,
   };
 }
 
@@ -687,6 +772,67 @@ function playbackStopKey(session: EmbySession, payload: SignedStreamPayload): st
   return `${session.serverUrl}\0${session.userId}\0${payload.itemId}\0${payload.playSessionId}`;
 }
 
+function clearTimer(timer: any): void {
+  if (timer) {
+    clearTimeout(timer);
+    clearInterval(timer);
+  }
+}
+
+function stopPlaybackProgressHeartbeat(session: EmbySession, payload: SignedStreamPayload): void {
+  const key = playbackStopKey(session, payload);
+  const existing = playbackProgressHeartbeats.get(key);
+  if (!existing) {
+    return;
+  }
+  clearTimer(existing.interval);
+  clearTimer(existing.timeout);
+  playbackProgressHeartbeats.delete(key);
+}
+
+function startPlaybackProgressHeartbeat(
+  session: EmbySession,
+  payload: SignedStreamPayload,
+  options: { leaseMs?: number; stopWhenLeaseExpires?: boolean } = {}
+): void {
+  const key = playbackStopKey(session, payload);
+  const existing = playbackProgressHeartbeats.get(key);
+  if (existing) {
+    if (options.leaseMs) {
+      clearTimer(existing.timeout);
+      existing.timeout = setTimeout(() => {
+        stopPlaybackProgressHeartbeat(session, payload);
+        if (options.stopWhenLeaseExpires) {
+          reportPlaybackStopped(session, payload).catch(() => {});
+        }
+      }, options.leaseMs);
+      existing.timeout?.unref?.();
+    }
+    return;
+  }
+
+  const interval = setInterval(() => {
+    reportPlaybackProgress(session, payload, {
+      EventName: 'TimeUpdate',
+      positionTicks: 0,
+    }).catch(() => {});
+  }, EMBY_PLAYBACK_PROGRESS_INTERVAL_MS);
+  interval?.unref?.();
+
+  let timeout;
+  if (options.leaseMs) {
+    timeout = setTimeout(() => {
+      stopPlaybackProgressHeartbeat(session, payload);
+      if (options.stopWhenLeaseExpires) {
+        reportPlaybackStopped(session, payload).catch(() => {});
+      }
+    }, options.leaseMs);
+    timeout?.unref?.();
+  }
+
+  playbackProgressHeartbeats.set(key, { interval, timeout });
+}
+
 function cancelPendingPlaybackStopped(session: EmbySession, payload: SignedStreamPayload): void {
   const key = playbackStopKey(session, payload);
   const existingTimer = playbackStopDebounces.get(key);
@@ -704,6 +850,7 @@ function schedulePlaybackStopped(session: EmbySession, payload: SignedStreamPayl
       return;
     }
     playbackStopDebounces.delete(key);
+    stopPlaybackProgressHeartbeat(session, payload);
     reportPlaybackStopped(session, payload).catch(() => {});
   }, getProxyStopDebounceMs());
   playbackStopDebounces.set(key, timer);
@@ -750,6 +897,8 @@ function buildSignedAddonStreamUrl(
     ext,
     audioStreamIndex: streamIndexes.audioStreamIndex,
     subtitleStreamIndex: streamIndexes.subtitleStreamIndex,
+    playbackClientId: session.playbackClientId,
+    playbackDeviceName: session.playbackDeviceName,
   });
 
   return `${addonHost}/emby/play/${encodeURIComponent(token)}/stream${ext ? `.${ext}` : ''}`;
@@ -999,6 +1148,7 @@ async function proxyEmbyStream(req: any, res: any, session: EmbySession, payload
   }
 
   const upstream = await requestProxyStreamWithRedirects(directUrl, headers);
+  startPlaybackProgressHeartbeat(session, payload);
 
   res.status(upstream.statusCode);
   for (const header of SAFE_PROXY_HEADERS) {
@@ -1044,9 +1194,12 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
     const signedToken = req.params?.signedToken;
     const payload = verifySignedEmbyStreamToken(signedToken);
     const config = await loadConfigFromDatabase(payload.userUUID);
+    const requestPlaybackClient = getEmbyPlaybackClientFromRequest(req);
     const session = await getEmbySession({
       ...config,
       userUUID: payload.userUUID,
+      playbackClientId: payload.playbackClientId || requestPlaybackClient.playbackClientId,
+      playbackDeviceName: payload.playbackDeviceName || requestPlaybackClient.playbackDeviceName,
     });
 
     if (!session) {
@@ -1072,6 +1225,10 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
       return;
     }
 
+    startPlaybackProgressHeartbeat(session, payload, {
+      leaseMs: EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
+      stopWhenLeaseExpires: true,
+    });
     res.redirect(302, directUrl);
   } catch (error: any) {
     const message = error?.message || 'Invalid Emby playback request';
@@ -1093,6 +1250,7 @@ export {
   getStreamExtension,
   isWebReadyDirectPlay,
   getEmbyDeviceId,
+  getEmbyPlaybackClientFromRequest,
   buildEmbyAuthorizationHeader,
   signEmbyStreamToken,
   verifySignedEmbyStreamToken,
@@ -1114,6 +1272,7 @@ module.exports = {
   getStreamExtension,
   isWebReadyDirectPlay,
   getEmbyDeviceId,
+  getEmbyPlaybackClientFromRequest,
   buildEmbyAuthorizationHeader,
   signEmbyStreamToken,
   verifySignedEmbyStreamToken,
