@@ -107,19 +107,25 @@ function makeWritableResponse() {
 
 test('getEmbyStreams calls PlaybackInfo and builds a Direct Play URL with MediaSourceId and PlaySessionId', async () => {
   await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
-    const calls = [];
+    const getCalls = [];
+    const postCalls = [];
     const emby = loadEmbyStreamsWithMocks({
       httpGet: async (url) => {
         const parsed = new URL(url);
-        calls.push(parsed);
+        getCalls.push(parsed);
 
         if (parsed.pathname === '/Users/user-1/Items') {
           return { data: { Items: [{ Id: 'item-1', Name: 'Problem Movie' }] } };
         }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+      httpPost: async (url, body, options) => {
+        const parsed = new URL(url);
+        postCalls.push({ url: parsed, body, options });
         if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
           return { data: makePlaybackInfo() };
         }
-        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+        throw new Error(`Unexpected Emby POST ${parsed.pathname}`);
       },
     });
 
@@ -135,7 +141,12 @@ test('getEmbyStreams calls PlaybackInfo and builds a Direct Play URL with MediaS
     });
 
     assert.equal(result.streams.length, 1);
-    assert.ok(calls.some((call) => call.pathname === '/Items/item-1/PlaybackInfo'));
+    assert.ok(getCalls.some((call) => call.pathname === '/Users/user-1/Items'));
+    assert.equal(postCalls.length, 1);
+    assert.equal(postCalls[0].url.pathname, '/Items/item-1/PlaybackInfo');
+    assert.equal(postCalls[0].body.IsPlayback, true);
+    assert.equal(postCalls[0].body.EnableTranscoding, true);
+    assert.ok(postCalls[0].body.DeviceProfile);
 
     const stream = result.streams[0];
     const streamUrl = new URL(stream.url);
@@ -235,10 +246,14 @@ test('legacy saved Emby config shape still generates streams without new optiona
         if (parsed.pathname === '/Users/user-1/Items') {
           return { data: { Items: [{ Id: 'item-1', Name: 'Legacy Config Movie' }] } };
         }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+      httpPost: async (url) => {
+        const parsed = new URL(url);
         if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
           return { data: { MediaSources: makePlaybackInfo({ Container: 'm4v' }).MediaSources } };
         }
-        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+        throw new Error(`Unexpected Emby POST ${parsed.pathname}`);
       },
     });
 
@@ -270,10 +285,14 @@ test('default redirect mode returns a signed addon URL without exposing Emby tok
         if (parsed.pathname === '/Users/user-1/Items') {
           return { data: { Items: [{ Id: 'item-1', Name: 'Problem MP4' }] } };
         }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+      httpPost: async (url) => {
+        const parsed = new URL(url);
         if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
           return { data: makePlaybackInfo({ Container: 'mp4', Path: '/server/movies/Problem MP4.mp4' }) };
         }
-        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+        throw new Error(`Unexpected Emby POST ${parsed.pathname}`);
       },
     });
 
@@ -303,6 +322,105 @@ test('default redirect mode returns a signed addon URL without exposing Emby tok
     assert.equal(payload.container, 'mp4');
     assert.equal(payload.playbackClientId, 'client-hash-1');
     assert.equal(payload.playbackDeviceName, 'AIO Addon client-hash-1');
+  });
+});
+
+test('PlaybackInfo profile uses Emby transcode fallback for unsupported FLAC audio without leaking tokens', async () => {
+  await withEnv({
+    HOST_NAME: 'https://addon.example',
+    EMBY_STREAM_PROXY_MODE: undefined,
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+  }, async () => {
+    const postCalls = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        const parsed = new URL(url);
+        if (parsed.pathname === '/Users/user-1/Items') {
+          return { data: { Items: [{ Id: 'item-1', Name: 'V for Vendetta' }] } };
+        }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+      httpPost: async (url, body) => {
+        const parsed = new URL(url);
+        postCalls.push({ url: parsed, body });
+        if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
+          return {
+            data: {
+              PlaySessionId: 'play-session-flac',
+              MediaSources: [
+                {
+                  Id: 'media-source-flac',
+                  Protocol: 'File',
+                  Container: 'mkv',
+                  SupportsDirectPlay: false,
+                  SupportsDirectStream: false,
+                  SupportsTranscoding: true,
+                  TranscodingUrl: '/videos/item-1/master.m3u8?MediaSourceId=media-source-flac&PlaySessionId=play-session-flac&AudioStreamIndex=1&TranscodingMaxAudioChannels=2&api_key=token-abc',
+                  TranscodingSubProtocol: 'hls',
+                  TranscodingContainer: 'ts',
+                  TranscodeReasons: 'AudioCodecNotSupported',
+                  Bitrate: 10_600_000,
+                  Size: 1_234_567_890,
+                  Path: '/server/movies/V for Vendetta.mkv',
+                  MediaStreams: [
+                    { Type: 'Video', Codec: 'h264', Index: 0 },
+                    { Type: 'Audio', Codec: 'flac', Index: 1, IsDefault: true, Channels: 6 },
+                  ],
+                },
+              ],
+            },
+          };
+        }
+        throw new Error(`Unexpected Emby POST ${parsed.pathname}`);
+      },
+    });
+
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      userUUID: 'addon-user-1',
+      apiKeys: {
+        embyServer: 'https://emby.example',
+        embyUserId: 'user-1',
+        embyAccessToken: 'token-abc',
+      },
+      playbackClientId: 'client-hash-1',
+      playbackDeviceName: 'AIO Addon client-hash-1',
+    });
+
+    assert.equal(result.streams.length, 1);
+    const directPlayAudio = postCalls[0].body.DeviceProfile.DirectPlayProfiles
+      .map((profile) => profile.AudioCodec || '')
+      .join(',');
+    assert.doesNotMatch(directPlayAudio, /(^|,)flac(,|$)/i);
+
+    const stream = result.streams[0];
+    assert.match(stream.description, /Emby Transcode/);
+    assert.match(stream.description, /AudioCodecNotSupported/);
+    assert.match(stream.behaviorHints.bingeGroup, /^emby-transcode-mkv-/);
+
+    const streamUrl = new URL(stream.url);
+    assert.equal(streamUrl.origin, 'https://addon.example');
+    assert.match(streamUrl.pathname, /^\/emby\/play\/[^/]+\/stream\.m3u8$/);
+    assert.doesNotMatch(stream.url, /token-abc|api_key|media-source-flac|play-session-flac/);
+
+    const signedToken = streamUrl.pathname.split('/')[3];
+    const payload = emby.verifySignedEmbyStreamToken(signedToken);
+    assert.equal(payload.playMethod, 'Transcode');
+    assert.equal(payload.mediaSourceId, 'media-source-flac');
+    assert.equal(payload.playSessionId, 'play-session-flac');
+    assert.equal(payload.audioStreamIndex, 1);
+    assert.equal(payload.ext, 'm3u8');
+    assert.doesNotMatch(payload.transcodingUrlPath, /api_key|token-abc/);
+
+    const playbackUrl = new URL(emby.buildPlaybackUrlFromPayload({
+      serverUrl: 'https://emby.example',
+      accessToken: 'token-abc',
+      userId: 'user-1',
+      userUUID: 'addon-user-1',
+    }, payload));
+    assert.equal(playbackUrl.pathname, '/videos/item-1/master.m3u8');
+    assert.equal(playbackUrl.searchParams.get('api_key'), 'token-abc');
+    assert.equal(playbackUrl.searchParams.get('MediaSourceId'), 'media-source-flac');
+    assert.equal(playbackUrl.searchParams.get('PlaySessionId'), 'play-session-flac');
   });
 });
 
@@ -381,6 +499,74 @@ test('signed playback route reports Sessions/Playing and redirects to final stat
     assert.equal(redirectUrl.searchParams.get('MediaSourceId'), 'media-source-1');
     assert.equal(redirectUrl.searchParams.get('PlaySessionId'), 'play-session-1');
     assert.equal(redirectUrl.searchParams.get('api_key'), 'token-abc');
+  });
+});
+
+test('signed playback route reports Transcode and redirects to Emby HLS URL', async () => {
+  await withEnv({
+    EMBY_STREAM_PROXY_MODE: 'proxy',
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+  }, async () => {
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async (url, body, options) => {
+        posts.push({ url: new URL(url), body, options });
+        return { data: {}, status: 204 };
+      },
+    });
+
+    const signedToken = emby.signEmbyStreamToken({
+      userUUID: 'addon-user-1',
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-flac',
+      playSessionId: 'play-session-flac',
+      container: 'mkv',
+      ext: 'm3u8',
+      playMethod: 'Transcode',
+      transcodingUrlPath: '/videos/item-1/master.m3u8?MediaSourceId=media-source-flac&PlaySessionId=play-session-flac&AudioStreamIndex=1',
+      audioStreamIndex: 1,
+      expiresAt: Date.now() + 60_000,
+    });
+    const res = {
+      redirectCode: null,
+      redirectUrl: null,
+      status() {
+        return this;
+      },
+      json() {
+        return this;
+      },
+      redirect(code, url) {
+        this.redirectCode = code;
+        this.redirectUrl = url;
+        return this;
+      },
+    };
+
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: {} },
+      res,
+      async () => ({
+        apiKeys: {
+          embyServer: 'https://emby.example',
+          embyUserId: 'user-1',
+          embyAccessToken: 'token-abc',
+        },
+      })
+    );
+
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url.pathname, '/Sessions/Playing');
+    assert.equal(posts[0].body.PlayMethod, 'Transcode');
+    assert.equal(posts[0].body.AudioStreamIndex, 1);
+
+    assert.equal(res.redirectCode, 302);
+    const redirectUrl = new URL(res.redirectUrl);
+    assert.equal(redirectUrl.pathname, '/videos/item-1/master.m3u8');
+    assert.equal(redirectUrl.searchParams.get('api_key'), 'token-abc');
+    assert.equal(redirectUrl.searchParams.get('MediaSourceId'), 'media-source-flac');
+    assert.equal(redirectUrl.searchParams.get('PlaySessionId'), 'play-session-flac');
+    assert.equal(redirectUrl.searchParams.get('AudioStreamIndex'), '1');
   });
 });
 

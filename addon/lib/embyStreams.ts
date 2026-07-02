@@ -18,6 +18,7 @@ const EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS = parsePositiveInt(
   ) * 1000
 );
 const EMBY_APP_NAME = 'AIO Addon';
+const EMBY_MAX_STREAMING_BITRATE = parsePositiveInt(process.env.EMBY_MAX_STREAMING_BITRATE, 120_000_000);
 
 const DEFAULT_FIELDS = [
   'ProviderIds',
@@ -86,7 +87,11 @@ interface EmbyMediaSource {
   RunTimeTicks?: number;
   SupportsDirectPlay?: boolean;
   SupportsDirectStream?: boolean;
+  SupportsTranscoding?: boolean;
   TranscodingUrl?: string;
+  TranscodingSubProtocol?: string;
+  TranscodingContainer?: string;
+  TranscodeReasons?: string | string[];
   MediaStreams?: EmbyMediaStream[];
 }
 
@@ -130,6 +135,8 @@ interface SignedStreamPayload {
   playSessionId: string;
   container: string;
   ext: string;
+  playMethod?: 'DirectPlay' | 'DirectStream' | 'Transcode';
+  transcodingUrlPath?: string;
   audioStreamIndex?: number;
   subtitleStreamIndex?: number;
   playbackClientId?: string;
@@ -333,10 +340,7 @@ function redactUrlShape(rawUrl: string): string {
   }
 }
 
-function debugPlayback(event: string, details: Record<string, any>): void {
-  if (!debugEnabled()) {
-    return;
-  }
+function sanitizePlaybackDetails(details: Record<string, any>): Record<string, any> {
   const safeDetails: Record<string, any> = {};
   for (const [key, value] of Object.entries(details)) {
     if (/token|api[_-]?key|password|secret/i.test(key)) {
@@ -347,7 +351,20 @@ function debugPlayback(event: string, details: Record<string, any>): void {
       safeDetails[key] = value;
     }
   }
+  return safeDetails;
+}
+
+function debugPlayback(event: string, details: Record<string, any>): void {
+  if (!debugEnabled()) {
+    return;
+  }
+  const safeDetails = sanitizePlaybackDetails(details);
   logger.debug(`[EmbyPlayback] ${event}`, safeDetails);
+}
+
+function infoPlayback(event: string, details: Record<string, any>): void {
+  const safeDetails = sanitizePlaybackDetails(details);
+  logger.info(`[EmbyPlayback] ${event}`, safeDetails);
 }
 
 async function authenticateEmby(serverUrl: string, username: string, password: string): Promise<EmbySession> {
@@ -448,7 +465,105 @@ async function getEmbyJson<T>(
   return setCached(itemCache, scopedCacheKey, data as T, EMBY_ITEM_CACHE_TTL_MS);
 }
 
+function buildNuvioDeviceProfile(): any {
+  const directPlayAudio = 'aac,mp3,ac3,eac3,opus';
+  return {
+    Name: 'Nuvio Android TV',
+    MaxStreamingBitrate: EMBY_MAX_STREAMING_BITRATE,
+    MaxStaticBitrate: EMBY_MAX_STREAMING_BITRATE,
+    MusicStreamingTranscodingBitrate: 384000,
+    DirectPlayProfiles: [
+      {
+        Type: 'Video',
+        Container: 'mp4,m4v',
+        VideoCodec: 'h264,hevc,mpeg4',
+        AudioCodec: directPlayAudio,
+      },
+      {
+        Type: 'Video',
+        Container: 'mkv,matroska,webm',
+        VideoCodec: 'h264,hevc,vp8,vp9,av1,mpeg4',
+        AudioCodec: `${directPlayAudio},vorbis`,
+      },
+      {
+        Type: 'Video',
+        Container: 'ts,m2ts',
+        VideoCodec: 'h264,hevc,mpeg2video',
+        AudioCodec: directPlayAudio,
+      },
+    ],
+    TranscodingProfiles: [
+      {
+        Type: 'Video',
+        Container: 'ts',
+        Protocol: 'hls',
+        AudioCodec: 'aac',
+        VideoCodec: 'h264,hevc,mpeg4',
+        Context: 'Streaming',
+        MaxAudioChannels: '2',
+        MinSegments: '1',
+        BreakOnNonKeyFrames: true,
+      },
+      {
+        Type: 'Video',
+        Container: 'mp4',
+        Protocol: 'http',
+        AudioCodec: 'aac',
+        VideoCodec: 'h264,hevc,mpeg4',
+        Context: 'Streaming',
+        MaxAudioChannels: '2',
+      },
+    ],
+    SubtitleProfiles: [
+      { Format: 'srt', Method: 'External' },
+      { Format: 'vtt', Method: 'External' },
+      { Format: 'ass', Method: 'External' },
+      { Format: 'ssa', Method: 'External' },
+    ],
+  };
+}
+
 async function getPlaybackInfo(session: EmbySession, itemId: string, options: Record<string, string | number | boolean | undefined> = {}): Promise<EmbyPlaybackInfo> {
+  const url = buildEmbyUrl(session.serverUrl, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
+    UserId: session.userId,
+    api_key: session.accessToken,
+  });
+  const body = {
+    UserId: session.userId,
+    StartTimeTicks: 0,
+    IsPlayback: true,
+    AutoOpenLiveStream: true,
+    EnableDirectPlay: true,
+    EnableDirectStream: true,
+    EnableTranscoding: true,
+    MaxStreamingBitrate: EMBY_MAX_STREAMING_BITRATE,
+    DeviceProfile: buildNuvioDeviceProfile(),
+    ...options,
+  };
+
+  try {
+    const { data } = await httpPost(
+      url,
+      body,
+      {
+        timeout: EMBY_TIMEOUT_MS,
+        headers: embyHeaders(session, {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        }),
+      }
+    );
+
+    return data || {};
+  } catch (error: any) {
+    logger.warn(`[Emby] PlaybackInfo POST failed for item ${itemId}; falling back to GET: ${error.message}`);
+    debugPlayback('playback-info:post-failed', {
+      userUUID: session.userUUID,
+      itemId,
+      error: error.message,
+    });
+  }
+
   const { data } = await httpGet(
     buildEmbyUrl(session.serverUrl, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
       UserId: session.userId,
@@ -604,6 +719,39 @@ function selectDirectPlayableSource(sourceOrItem: EmbyMediaSource[] | EmbyItem):
     .sort((left, right) => directPlaySourceScore(right) - directPlaySourceScore(left))[0];
 }
 
+function isTranscodingSource(source: EmbyMediaSource): boolean {
+  if (source.SupportsTranscoding === false) {
+    return false;
+  }
+  return Boolean(String(source.TranscodingUrl || '').trim());
+}
+
+function transcodeSourceScore(source: EmbyMediaSource): number {
+  let score = 0;
+  if (source.SupportsTranscoding === true) score += 100;
+  if (source.TranscodingSubProtocol && source.TranscodingSubProtocol.toLowerCase() === 'hls') score += 30;
+  if (source.TranscodingContainer) score += 15;
+  if (source.Id) score += 10;
+  if (source.Bitrate) score += Math.min(25, Math.round(source.Bitrate / 1_000_000));
+  return score;
+}
+
+function selectTranscodingSource(sourceOrItem: EmbyMediaSource[] | EmbyItem): EmbyMediaSource | null {
+  const sources = Array.isArray(sourceOrItem) ? sourceOrItem : sourceOrItem.MediaSources;
+  if (!Array.isArray(sources) || sources.length === 0) {
+    return null;
+  }
+
+  const candidates = sources.filter(isTranscodingSource);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  return candidates
+    .slice()
+    .sort((left, right) => transcodeSourceScore(right) - transcodeSourceScore(left))[0];
+}
+
 function generateFallbackPlaySessionId(session: EmbySession, itemId: string, mediaSourceId: string): string {
   return `addon-${crypto.randomBytes(8).toString('hex')}-${hashCacheKey(`${session.serverUrl}\0${session.userId}\0${itemId}\0${mediaSourceId}`).slice(0, 16)}`;
 }
@@ -687,6 +835,55 @@ function buildStaticStreamUrl(
     SubtitleStreamIndex: streamIndexes.subtitleStreamIndex,
     api_key: session.accessToken,
   });
+}
+
+function getTranscodingStreamExtension(mediaSource: EmbyMediaSource, transcodingUrlPath?: string): string {
+  const subProtocol = String(mediaSource.TranscodingSubProtocol || '').toLowerCase();
+  const transcodeContainer = normalizeContainer(mediaSource.TranscodingContainer);
+  const rawUrl = String(transcodingUrlPath || mediaSource.TranscodingUrl || '');
+
+  if (subProtocol === 'hls' || /\.m3u8(?:$|\?)/i.test(rawUrl)) {
+    return 'm3u8';
+  }
+  if (transcodeContainer) {
+    return getStreamExtension(transcodeContainer) || transcodeContainer;
+  }
+  return getStreamExtension(mediaSource.Container) || '';
+}
+
+function sanitizeTranscodingUrlPath(rawUrl: string | undefined): string | undefined {
+  const value = String(rawUrl || '').trim();
+  if (!value) {
+    return undefined;
+  }
+
+  try {
+    const parsed = new URL(value, 'http://emby.local');
+    for (const key of ['api_key', 'access_token', 'token']) {
+      parsed.searchParams.delete(key);
+    }
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildTranscodingStreamUrl(session: EmbySession, payload: SignedStreamPayload): string {
+  const parsed = new URL(payload.transcodingUrlPath || '/', session.serverUrl);
+  if (!parsed.searchParams.has('MediaSourceId')) {
+    parsed.searchParams.set('MediaSourceId', payload.mediaSourceId);
+  }
+  if (!parsed.searchParams.has('PlaySessionId')) {
+    parsed.searchParams.set('PlaySessionId', payload.playSessionId);
+  }
+  if (typeof payload.audioStreamIndex === 'number' && !parsed.searchParams.has('AudioStreamIndex')) {
+    parsed.searchParams.set('AudioStreamIndex', String(payload.audioStreamIndex));
+  }
+  if (typeof payload.subtitleStreamIndex === 'number' && !parsed.searchParams.has('SubtitleStreamIndex')) {
+    parsed.searchParams.set('SubtitleStreamIndex', String(payload.subtitleStreamIndex));
+  }
+  parsed.searchParams.set('api_key', session.accessToken);
+  return parsed.toString();
 }
 
 function getStreamSigningSecret(): string {
@@ -879,7 +1076,12 @@ function buildSignedAddonStreamUrl(
   itemId: string,
   mediaSource: EmbyMediaSource,
   playSessionId: string,
-  streamIndexes: { audioStreamIndex?: number; subtitleStreamIndex?: number }
+  streamIndexes: { audioStreamIndex?: number; subtitleStreamIndex?: number },
+  options: {
+    playMethod?: 'DirectPlay' | 'DirectStream' | 'Transcode';
+    transcodingUrlPath?: string;
+    ext?: string;
+  } = {}
 ): string | null {
   const addonHost = getAddonHost();
   const userUUID = session.userUUID;
@@ -887,7 +1089,7 @@ function buildSignedAddonStreamUrl(
     return null;
   }
 
-  const ext = getStreamExtension(mediaSource.Container);
+  const ext = options.ext ?? getStreamExtension(mediaSource.Container);
   const token = signEmbyStreamToken({
     userUUID,
     itemId,
@@ -895,6 +1097,8 @@ function buildSignedAddonStreamUrl(
     playSessionId,
     container: normalizeContainer(mediaSource.Container) || ext || 'unknown',
     ext,
+    playMethod: options.playMethod || 'DirectPlay',
+    transcodingUrlPath: options.transcodingUrlPath,
     audioStreamIndex: streamIndexes.audioStreamIndex,
     subtitleStreamIndex: streamIndexes.subtitleStreamIndex,
     playbackClientId: session.playbackClientId,
@@ -904,7 +1108,11 @@ function buildSignedAddonStreamUrl(
   return `${addonHost}/emby/play/${encodeURIComponent(token)}/stream${ext ? `.${ext}` : ''}`;
 }
 
-function buildDirectPlayUrlFromPayload(session: EmbySession, payload: SignedStreamPayload): string {
+function buildPlaybackUrlFromPayload(session: EmbySession, payload: SignedStreamPayload): string {
+  if (payload.playMethod === 'Transcode' && payload.transcodingUrlPath) {
+    return buildTranscodingStreamUrl(session, payload);
+  }
+
   const mediaSource: EmbyMediaSource = {
     Id: payload.mediaSourceId,
     Container: payload.container,
@@ -924,7 +1132,7 @@ function buildPlaybackEventPayload(payload: SignedStreamPayload, positionTicks =
     IsPaused: false,
     IsMuted: false,
     PositionTicks: positionTicks,
-    PlayMethod: 'DirectPlay',
+    PlayMethod: payload.playMethod || 'DirectPlay',
     PlaySessionId: payload.playSessionId,
     PlaylistIndex: 0,
     PlaylistLength: 1,
@@ -953,6 +1161,15 @@ async function postPlaybackEvent(session: EmbySession, endpoint: string, payload
         }),
       }
     );
+    if (eventName === 'Sessions/Playing' || eventName === 'Sessions/Playing/Stopped') {
+      infoPlayback(`${eventName}:success`, {
+        userUUID: session.userUUID,
+        itemId: payload.ItemId,
+        mediaSourceId: payload.MediaSourceId,
+        playSessionId: payload.PlaySessionId,
+        playMethod: payload.PlayMethod,
+      });
+    }
     debugPlayback(`${eventName}:success`, {
       userUUID: session.userUUID,
       itemId: payload.ItemId,
@@ -991,41 +1208,135 @@ async function reportPlaybackStopped(session: EmbySession, payload: SignedStream
   return postPlaybackEvent(session, '/Sessions/Playing/Stopped', buildPlaybackEventPayload(payload, positionTicks), 'Sessions/Playing/Stopped');
 }
 
-function toEmbyStream(session: EmbySession, item: EmbyItem, mediaSource: EmbyMediaSource, playSessionId: string): any {
+function isHttpsBaseUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isWebReadyPlayback(input: { serverUrl: string; container?: string; ext?: string; playMethod: 'DirectPlay' | 'DirectStream' | 'Transcode' }): boolean {
+  if (input.playMethod === 'Transcode') {
+    const ext = String(input.ext || '').toLowerCase();
+    return isHttpsBaseUrl(input.serverUrl) && (ext === 'm3u8' || ext === 'mp4' || ext === 'm4v');
+  }
+  return isWebReadyDirectPlay({ serverUrl: input.serverUrl, container: input.container });
+}
+
+function normalizeTranscodeReasons(value: string | string[] | undefined): string[] {
+  if (Array.isArray(value)) {
+    return value.map((reason) => String(reason || '').trim()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(/[,\s]+/)
+    .map((reason) => reason.trim())
+    .filter(Boolean);
+}
+
+function toEmbyStream(
+  session: EmbySession,
+  item: EmbyItem,
+  mediaSource: EmbyMediaSource,
+  playSessionId: string,
+  playbackOptions: {
+    playMethod?: 'DirectPlay' | 'DirectStream' | 'Transcode';
+    transcodingUrlPath?: string;
+  } = {}
+): any {
+  const playMethod = playbackOptions.playMethod || 'DirectPlay';
   const container = normalizeContainer(mediaSource.Container);
-  const extension = getStreamExtension(mediaSource.Container);
+  const extension = playMethod === 'Transcode'
+    ? getTranscodingStreamExtension(mediaSource, playbackOptions.transcodingUrlPath)
+    : getStreamExtension(mediaSource.Container);
+  const mediaSourceId = mediaSource.Id || item.Id;
   const bitrateText = formatBitrate(mediaSource.Bitrate);
-  const details = [container ? container.toUpperCase() : '', bitrateText].filter(Boolean).join(' - ');
+  const playbackLabel = playMethod === 'Transcode' ? 'Transcode' : playMethod === 'DirectStream' ? 'Direct Stream' : 'Direct Play';
+  const transcodeContainer = normalizeContainer(mediaSource.TranscodingContainer);
+  const displayContainer = playMethod === 'Transcode'
+    ? [String(mediaSource.TranscodingSubProtocol || '').toUpperCase(), transcodeContainer ? transcodeContainer.toUpperCase() : ''].filter(Boolean).join(' ')
+    : container.toUpperCase();
+  const details = [displayContainer, bitrateText].filter(Boolean).join(' - ');
   const filename = getMediaSourceFilename(item, mediaSource);
   const videoSize = getMediaSize(item, mediaSource);
   const mediaStreams = getMediaStreams(item, mediaSource);
   const audioStreamIndex = selectStreamIndex(mediaStreams, 'Audio');
   const subtitleStreamIndex = selectStreamIndex(mediaStreams, 'Subtitle');
   const streamIndexes = { audioStreamIndex, subtitleStreamIndex };
-  const directUrl = buildStaticStreamUrl(session, item.Id, mediaSource, playSessionId, streamIndexes);
+  const playbackPayload: SignedStreamPayload = {
+    userUUID: session.userUUID || '',
+    itemId: item.Id,
+    mediaSourceId,
+    playSessionId,
+    container: container || extension || 'unknown',
+    ext: extension,
+    playMethod,
+    transcodingUrlPath: playbackOptions.transcodingUrlPath,
+    audioStreamIndex,
+    subtitleStreamIndex,
+    playbackClientId: session.playbackClientId,
+    playbackDeviceName: session.playbackDeviceName,
+    expiresAt: Date.now() + EMBY_STREAM_TOKEN_TTL_MS,
+  };
+  const directUrl = playMethod === 'Transcode' && playbackOptions.transcodingUrlPath
+    ? buildTranscodingStreamUrl(session, playbackPayload)
+    : buildStaticStreamUrl(session, item.Id, mediaSource, playSessionId, streamIndexes);
   const mode = getEmbyStreamProxyMode();
-  const signedUrl = mode === 'off' ? null : buildSignedAddonStreamUrl(session, item.Id, mediaSource, playSessionId, streamIndexes);
+  const signedUrl = mode === 'off' ? null : buildSignedAddonStreamUrl(session, item.Id, mediaSource, playSessionId, streamIndexes, {
+    playMethod,
+    transcodingUrlPath: playbackOptions.transcodingUrlPath,
+    ext: extension,
+  });
   const url = signedUrl || directUrl;
-  const notWebReady = !isWebReadyDirectPlay({ serverUrl: session.serverUrl, container });
+  const notWebReady = !isWebReadyPlayback({ serverUrl: session.serverUrl, container, ext: extension, playMethod });
   const videoStream = mediaStreams.find((stream) => String(stream.Type || '').toLowerCase() === 'video');
   const audioStream = mediaStreams.find((stream) => String(stream.Type || '').toLowerCase() === 'audio' && (audioStreamIndex === undefined || stream.Index === audioStreamIndex));
   const subtitleStream = mediaStreams.find((stream) => String(stream.Type || '').toLowerCase() === 'subtitle' && (subtitleStreamIndex === undefined || stream.Index === subtitleStreamIndex));
+  const transcodeReasons = normalizeTranscodeReasons(mediaSource.TranscodeReasons);
 
-  debugPlayback('stream-built', {
+  infoPlayback('stream-selected', {
     userUUID: session.userUUID,
     itemId: item.Id,
-    mediaSourceId: mediaSource.Id || item.Id,
+    mediaSourceId,
     playSessionId,
+    playMethod,
     selectedContainer: container,
+    transcodingSubProtocol: mediaSource.TranscodingSubProtocol,
+    transcodingContainer: mediaSource.TranscodingContainer,
+    transcodeReasons,
     selectedBitrate: mediaSource.Bitrate,
     selectedVideoCodec: videoStream?.Codec,
     selectedAudioCodec: audioStream?.Codec,
+    selectedAudioChannels: (audioStream as any)?.Channels,
+    selectedAudioIndex: audioStreamIndex,
+    selectedSubtitleIndex: subtitleStreamIndex,
+    streamExtension: extension,
+    static: playMethod !== 'Transcode',
+    mode: signedUrl ? mode : 'direct',
+    notWebReady,
+    hasFilename: Boolean(filename),
+    hasVideoSize: Boolean(videoSize),
+  });
+  debugPlayback('stream-built', {
+    userUUID: session.userUUID,
+    itemId: item.Id,
+    mediaSourceId,
+    playSessionId,
+    playMethod,
+    selectedContainer: container,
+    transcodingSubProtocol: mediaSource.TranscodingSubProtocol,
+    transcodingContainer: mediaSource.TranscodingContainer,
+    transcodeReasons,
+    selectedBitrate: mediaSource.Bitrate,
+    selectedVideoCodec: videoStream?.Codec,
+    selectedAudioCodec: audioStream?.Codec,
+    selectedAudioChannels: (audioStream as any)?.Channels,
     selectedAudioIndex: audioStreamIndex,
     selectedSubtitleIndex: subtitleStreamIndex,
     finalUrl: url,
     directUrl,
     streamExtension: extension,
-    static: true,
+    static: playMethod !== 'Transcode',
     mode: signedUrl ? mode : 'direct',
     notWebReady,
     hasFilename: Boolean(filename),
@@ -1035,13 +1346,13 @@ function toEmbyStream(session: EmbySession, item: EmbyItem, mediaSource: EmbyMed
   return {
     name: 'Emby',
     title: details ? `Emby\n${details}` : 'Emby',
-    description: ['Emby Direct Play', details, filename].filter(Boolean).join('\n'),
+    description: [`Emby ${playbackLabel}`, details, transcodeReasons.length ? `Reason: ${transcodeReasons.join(', ')}` : '', filename].filter(Boolean).join('\n'),
     url,
     behaviorHints: {
       notWebReady,
       filename,
       videoSize,
-      bingeGroup: `emby-directplay-${container || 'unknown'}-${qualityBucket(mediaSource.Bitrate)}`,
+      bingeGroup: `emby-${playMethod.toLowerCase()}-${container || transcodeContainer || 'unknown'}-${qualityBucket(mediaSource.Bitrate)}`,
     },
   };
 }
@@ -1055,14 +1366,25 @@ async function toPlaybackAwareEmbyStream(session: EmbySession, item: EmbyItem): 
   const mediaSources = Array.isArray(playbackInfo.MediaSources) && playbackInfo.MediaSources.length > 0
     ? playbackInfo.MediaSources
     : item.MediaSources || [];
-  const mediaSource = selectDirectPlayableSource(mediaSources);
-  if (!mediaSource) {
+  const directSource = selectDirectPlayableSource(mediaSources);
+  if (directSource) {
+    const mediaSourceId = directSource.Id || item.Id;
+    const playSessionId = playbackInfo.PlaySessionId || generateFallbackPlaySessionId(session, item.Id, mediaSourceId);
+    return toEmbyStream(session, item, directSource, playSessionId, { playMethod: 'DirectPlay' });
+  }
+
+  const transcodeSource = selectTranscodingSource(mediaSources);
+  const transcodingUrlPath = sanitizeTranscodingUrlPath(transcodeSource?.TranscodingUrl);
+  if (!transcodeSource || !transcodingUrlPath) {
     return null;
   }
 
-  const mediaSourceId = mediaSource.Id || item.Id;
+  const mediaSourceId = transcodeSource.Id || item.Id;
   const playSessionId = playbackInfo.PlaySessionId || generateFallbackPlaySessionId(session, item.Id, mediaSourceId);
-  return toEmbyStream(session, item, mediaSource, playSessionId);
+  return toEmbyStream(session, item, transcodeSource, playSessionId, {
+    playMethod: 'Transcode',
+    transcodingUrlPath,
+  });
 }
 
 async function getEmbyMovieStream(session: EmbySession, id: string, config: any): Promise<any | null> {
@@ -1208,20 +1530,33 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
     }
 
     await reportPlaybackStarted(session, payload);
-    const directUrl = buildDirectPlayUrlFromPayload(session, payload);
+    const playbackUrl = buildPlaybackUrlFromPayload(session, payload);
     const mode = getEmbyStreamProxyMode();
+    const effectiveMode = payload.playMethod === 'Transcode' && mode === 'proxy' ? 'redirect' : mode;
 
+    infoPlayback('signed-url-requested', {
+      userUUID: payload.userUUID,
+      itemId: payload.itemId,
+      mediaSourceId: payload.mediaSourceId,
+      playSessionId: payload.playSessionId,
+      playMethod: payload.playMethod || 'DirectPlay',
+      mode: effectiveMode,
+      requestedMode: mode,
+      playbackUrl,
+    });
     debugPlayback('signed-url-requested', {
       userUUID: payload.userUUID,
       itemId: payload.itemId,
       mediaSourceId: payload.mediaSourceId,
       playSessionId: payload.playSessionId,
-      mode,
-      directUrl,
+      playMethod: payload.playMethod || 'DirectPlay',
+      mode: effectiveMode,
+      requestedMode: mode,
+      playbackUrl,
     });
 
-    if (mode === 'proxy') {
-      await proxyEmbyStream(req, res, session, payload, directUrl);
+    if (effectiveMode === 'proxy') {
+      await proxyEmbyStream(req, res, session, payload, playbackUrl);
       return;
     }
 
@@ -1229,7 +1564,7 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
       leaseMs: EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
       stopWhenLeaseExpires: true,
     });
-    res.redirect(302, directUrl);
+    res.redirect(302, playbackUrl);
   } catch (error: any) {
     const message = error?.message || 'Invalid Emby playback request';
     const status = message.includes('expired') ? 410 : 400;
@@ -1245,13 +1580,17 @@ export {
   normalizeBaseUrl,
   buildEmbyUrl,
   buildStaticStreamUrl,
+  buildNuvioDeviceProfile,
   getPlaybackInfo,
   selectDirectPlayableSource,
+  selectTranscodingSource,
   getStreamExtension,
   isWebReadyDirectPlay,
   getEmbyDeviceId,
   getEmbyPlaybackClientFromRequest,
   buildEmbyAuthorizationHeader,
+  sanitizeTranscodingUrlPath,
+  buildPlaybackUrlFromPayload,
   signEmbyStreamToken,
   verifySignedEmbyStreamToken,
   reportPlaybackStarted,
@@ -1267,13 +1606,17 @@ module.exports = {
   normalizeBaseUrl,
   buildEmbyUrl,
   buildStaticStreamUrl,
+  buildNuvioDeviceProfile,
   getPlaybackInfo,
   selectDirectPlayableSource,
+  selectTranscodingSource,
   getStreamExtension,
   isWebReadyDirectPlay,
   getEmbyDeviceId,
   getEmbyPlaybackClientFromRequest,
   buildEmbyAuthorizationHeader,
+  sanitizeTranscodingUrlPath,
+  buildPlaybackUrlFromPayload,
   signEmbyStreamToken,
   verifySignedEmbyStreamToken,
   reportPlaybackStarted,

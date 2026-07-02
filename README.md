@@ -75,7 +75,11 @@ The backend requires `DATABASE_URI` in the environment.
 
 ## Emby Direct Play
 
-Emby streams are generated through `/Items/{Id}/PlaybackInfo` before the addon returns a Stremio stream. The selected Direct Play media source is used to build a static Emby URL with `MediaSourceId`, `PlaySessionId`, `static=true`, the existing saved Emby access token, and a container-specific path such as `stream.mkv` or `stream.mp4`.
+Emby streams are generated through a playback-aware `POST /Items/{Id}/PlaybackInfo` before the addon returns a Stremio stream. The request includes a Nuvio/Android-TV-style device profile so Emby can decide whether the selected source should Direct Play or transcode unsupported client capabilities such as FLAC 5.1 audio.
+
+When Emby returns a Direct Play-capable media source, the addon builds a static Emby URL with `MediaSourceId`, `PlaySessionId`, `static=true`, the existing saved Emby access token, and a container-specific path such as `stream.mkv` or `stream.mp4`. When Direct Play is not supported and Emby returns a `TranscodingUrl`, the signed addon URL carries only the sanitized transcode path; the server reattaches the saved Emby access token after signature validation and redirects to Emby's HLS/AAC URL.
+
+The Stremio stream JSON route uses `Cache-Control: no-store` and does not emit ETags. Each click asks the addon for a fresh signed playback URL and a fresh Emby PlaybackInfo/PlaySessionId instead of reusing stale session data from client or proxy cache.
 
 Existing Emby users do not need to reauthenticate. The addon still reads the saved `apiKeys.embyServer`, `apiKeys.embyUserId`, and `apiKeys.embyAccessToken` fields.
 
@@ -91,6 +95,8 @@ Modes:
 - `proxy`: uses the same signed URL, reports playback start, forwards `Range` requests and upstream `206`/range headers through the addon, sends progress heartbeats while the proxy connection is active, and sends best-effort stopped reporting when the connection closes.
 - `off`: returns the direct Emby static URL without addon playback reporting.
 
+HLS transcode handoff uses redirect mode even if proxy mode is requested, because proxying only the master playlist without rewriting segment URLs can break playback. Direct Play streams can still use proxy mode for range-preserving diagnostics.
+
 Optional diagnostics:
 
 ```bash
@@ -100,6 +106,8 @@ EMBY_STREAM_STOP_DEBOUNCE_MS=1500
 EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS=21600
 ```
+
+Core playback decisions are logged with redacted URL/token fields. `EMBY_DEBUG_PLAYBACK=true` adds the detailed URL shape and proxy-response diagnostics without logging Emby access tokens, `api_key` values, passwords, or signed stream tokens.
 
 If `EMBY_STREAM_SIGNING_SECRET` is not set, the addon derives a stable signing secret from existing server-only secrets such as `ADDON_PASSWORD`, `ADMIN_KEY`, or `DATABASE_URI`. If none are available, only newly generated signed playback URLs expire on restart; saved Emby auth is not changed.
 

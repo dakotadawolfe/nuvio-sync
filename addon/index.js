@@ -298,8 +298,9 @@ const respond = function (req, res, data, opts) {
 
     const routePath = req.route?.path || '';
     const isCatalogOrMetaRoute = routePath.includes('/catalog/') || routePath.includes('/meta/');
+    const isStreamRoute = routePath.includes('/stream/');
 
-    if (!isCatalogOrMetaRoute) {
+    if (!isCatalogOrMetaRoute && !isStreamRoute) {
       // Preserve rich ETag behavior for non-hot routes (e.g., manifest/debug endpoints).
       const configHash = req.userConfig?.configHash
         || crypto.createHash('md5').update(req.userConfig ? JSON.stringify(req.userConfig) : '').digest('hex').substring(0, 8);
@@ -334,6 +335,10 @@ const respond = function (req, res, data, opts) {
         // Manifest: No cache at all - always fresh
         cacheControl = "no-cache, no-store, must-revalidate, max-age=0, s-maxage=0";
         consola.debug('[Cache] Setting manifest Cache-Control:', cacheControl);
+      } else if (req.route.path.includes('/stream/')) {
+        // Stream routes include short-lived signed playback URLs and Emby PlaySessionIds.
+        cacheControl = "no-store, no-cache, must-revalidate, private, max-age=0, s-maxage=0";
+        consola.debug('[Cache] Setting stream Cache-Control:', cacheControl);
       } else if (req.route.path.includes('/catalog/')) {
         // Catalog: Very short cache with aggressive revalidation
         const configVersion = req.userConfig?.configVersion || Date.now();
@@ -374,6 +379,14 @@ const respond = function (req, res, data, opts) {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
   }
+
+  if (req.route && req.route.path && req.route.path.includes('/stream/')) {
+    res.removeHeader?.('ETag');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0, s-maxage=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  }
   
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -399,6 +412,11 @@ const respond = function (req, res, data, opts) {
   }
 
   stripReleaseAvailabilityForResponse(data);
+  if (req.route && req.route.path && req.route.path.includes('/stream/')) {
+    const jsonBody = JSON.stringify(data);
+    res.setHeader('Content-Length', Buffer.byteLength(jsonBody));
+    return res.end(jsonBody);
+  }
   res.send(data);
 };
 

@@ -33,11 +33,14 @@ EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 | 5 | MP4 Direct Play with subtitles on |  |  |  |
 | 6 | MKV Direct Play with subtitles off |  |  |  |
 | 7 | MKV Direct Play with subtitles on |  |  |  |
-| 8 | Alternate audio track if available |  |  |  |
+| 8 | MKV with FLAC 5.1 audio, for example `tt0434409` |  |  |  |
+| 9 | Alternate audio track if available |  |  |  |
 
 ## Evidence To Capture For Each Row
 
 - Direct Play vs Direct Stream vs Transcode.
+- PlaybackInfo method (`POST` preferred; GET should only appear as fallback after POST failure).
+- Transcode reason if Emby chooses Transcode, for example `AudioCodecNotSupported`.
 - Item id.
 - Media source id.
 - Play session id.
@@ -47,7 +50,7 @@ EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 - Selected subtitle stream and index.
 - Final stream URL path shape with tokens redacted.
 - Whether `static=true` is used.
-- Whether HLS is accidentally used.
+- Whether HLS is used deliberately because Emby selected Transcode.
 - Whether `behaviorHints.notWebReady` is true or false.
 - Whether Nuvio/Stremio requests byte ranges.
 - Whether Emby returns `200` or `206`.
@@ -62,5 +65,7 @@ EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 - Existing saved `apiKeys.embyServer`, `apiKeys.embyUserId`, and `apiKeys.embyAccessToken` values must continue to work.
 - MP4 and MKV must both use the PlaybackInfo/session-aware path.
 - Direct Play-capable items must stay Direct Play/static and must not be forced to HLS/transcode.
+- Unsupported client audio such as FLAC 5.1 should use Emby's PlaybackInfo-selected transcode path instead of a raw static MKV handoff.
+- Stream JSON responses must be `no-store` and must not use ETags, so a new click does not reuse stale signed playback session data.
 - Proxy mode should preserve `Range`, `206 Partial Content`, `Content-Range`, `Accept-Ranges`, `Content-Length`, `Content-Type`, `ETag`, and `Last-Modified`.
 - Proxy mode should follow upstream Emby redirects without dropping the requested byte range.
