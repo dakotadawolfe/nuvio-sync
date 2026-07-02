@@ -75,7 +75,7 @@ The backend requires `DATABASE_URI` in the environment.
 
 ## Emby Direct Play
 
-Emby streams are generated through a playback-aware `POST /Items/{Id}/PlaybackInfo` before the addon returns a Stremio stream. The request includes a Nuvio/Android-TV-style device profile so Emby can decide whether the selected source should Direct Play or transcode unsupported client capabilities such as FLAC 5.1 audio.
+Emby streams are generated through a playback-aware `POST /Items/{Id}/PlaybackInfo` before the addon returns a Stremio stream. The request includes a Nuvio/Android-TV-style device profile so Emby can decide whether the selected source should Direct Play or transcode for the advertised client capabilities.
 
 When Emby returns a Direct Play-capable media source, the addon builds a static Emby URL with `MediaSourceId`, `PlaySessionId`, `static=true`, the existing saved Emby access token, and a container-specific path such as `stream.mkv` or `stream.mp4`. When Direct Play is not supported and Emby returns a `TranscodingUrl`, the signed addon URL carries only the sanitized transcode path; the server reattaches the saved Emby access token after signature validation and redirects to Emby's HLS/AAC URL.
 
@@ -105,6 +105,7 @@ EMBY_STREAM_SIGNING_SECRET=replace-with-stable-server-secret
 EMBY_STREAM_STOP_DEBOUNCE_MS=1500
 EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS=21600
+EMBY_DIRECT_PLAY_AUDIO_CODECS=aac,mp3,ac3,eac3,opus,flac
 ```
 
 Core playback decisions are logged with redacted URL/token fields. `EMBY_DEBUG_PLAYBACK=true` adds the detailed URL shape and proxy-response diagnostics without logging Emby access tokens, `api_key` values, passwords, or signed stream tokens.

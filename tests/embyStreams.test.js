@@ -325,7 +325,69 @@ test('default redirect mode returns a signed addon URL without exposing Emby tok
   });
 });
 
-test('PlaybackInfo profile uses Emby transcode fallback for unsupported FLAC audio without leaking tokens', async () => {
+test('FLAC stays Direct Play when Emby PlaybackInfo reports the source is direct-playable', async () => {
+  await withEnv({
+    HOST_NAME: 'https://addon.example',
+    EMBY_STREAM_PROXY_MODE: undefined,
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+  }, async () => {
+    const postCalls = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        const parsed = new URL(url);
+        if (parsed.pathname === '/Users/user-1/Items') {
+          return { data: { Items: [{ Id: 'item-1', Name: 'FLAC Direct Movie' }] } };
+        }
+        throw new Error(`Unexpected Emby GET ${parsed.pathname}`);
+      },
+      httpPost: async (url, body) => {
+        const parsed = new URL(url);
+        postCalls.push({ url: parsed, body });
+        if (parsed.pathname === '/Items/item-1/PlaybackInfo') {
+          return {
+            data: makePlaybackInfo({
+              Container: 'mkv',
+              SupportsDirectPlay: true,
+              SupportsDirectStream: false,
+              MediaStreams: [
+                { Type: 'Video', Codec: 'h264', Index: 0 },
+                { Type: 'Audio', Codec: 'flac', Index: 1, IsDefault: true, Channels: 6 },
+              ],
+            }),
+          };
+        }
+        throw new Error(`Unexpected Emby POST ${parsed.pathname}`);
+      },
+    });
+
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      userUUID: 'addon-user-1',
+      apiKeys: {
+        embyServer: 'https://emby.example',
+        embyUserId: 'user-1',
+        embyAccessToken: 'token-abc',
+      },
+    });
+
+    assert.equal(result.streams.length, 1);
+    const directPlayAudio = postCalls[0].body.DeviceProfile.DirectPlayProfiles
+      .map((profile) => profile.AudioCodec || '')
+      .join(',');
+    assert.match(directPlayAudio, /(^|,)flac(,|$)/i);
+
+    const stream = result.streams[0];
+    assert.match(stream.description, /Emby Direct Play/);
+    assert.match(stream.behaviorHints.bingeGroup, /^emby-directplay-mkv-/);
+
+    const signedToken = new URL(stream.url).pathname.split('/')[3];
+    const payload = emby.verifySignedEmbyStreamToken(signedToken);
+    assert.equal(payload.playMethod, 'DirectPlay');
+    assert.equal(payload.ext, 'mkv');
+    assert.equal(payload.transcodingUrlPath, undefined);
+  });
+});
+
+test('PlaybackInfo transcode fallback is used only when Emby returns an unsupported source with TranscodingUrl', async () => {
   await withEnv({
     HOST_NAME: 'https://addon.example',
     EMBY_STREAM_PROXY_MODE: undefined,
@@ -390,7 +452,7 @@ test('PlaybackInfo profile uses Emby transcode fallback for unsupported FLAC aud
     const directPlayAudio = postCalls[0].body.DeviceProfile.DirectPlayProfiles
       .map((profile) => profile.AudioCodec || '')
       .join(',');
-    assert.doesNotMatch(directPlayAudio, /(^|,)flac(,|$)/i);
+    assert.match(directPlayAudio, /(^|,)flac(,|$)/i);
 
     const stream = result.streams[0];
     assert.match(stream.description, /Emby Transcode/);

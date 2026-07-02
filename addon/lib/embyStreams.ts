@@ -466,7 +466,11 @@ async function getEmbyJson<T>(
 }
 
 function buildNuvioDeviceProfile(): any {
-  const directPlayAudio = 'aac,mp3,ac3,eac3,opus';
+  const directPlayAudio = String(process.env.EMBY_DIRECT_PLAY_AUDIO_CODECS || 'aac,mp3,ac3,eac3,opus,flac')
+    .split(',')
+    .map((codec) => codec.trim().toLowerCase())
+    .filter(Boolean)
+    .join(',');
   return {
     Name: 'Nuvio Android TV',
     MaxStreamingBitrate: EMBY_MAX_STREAMING_BITRATE,
