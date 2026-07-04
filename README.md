@@ -7,7 +7,7 @@ The configure page exposes only the pieces this instance uses:
 - Required metadata keys: TMDB, TheTVDB, and RPDB.
 - Required account connections: Trakt and Emby.
 - Curated catalog defaults with Trakt recommendations first.
-- Built-in OpenSubtitles v3 proxying so subtitles work through this addon.
+- Built-in OpenSubtitles v3 proxying, with optional SubDL fallback, so subtitles work through this addon.
 - A simple configuration status and save/install flow.
 
 Hidden upstream options are intentionally not part of this setup.
@@ -82,6 +82,10 @@ When Emby returns a Direct Play-capable media source, the addon builds a static 
 The Stremio stream JSON route uses `Cache-Control: no-store` and does not emit ETags. Each click asks the addon for a fresh signed playback URL and a fresh Emby PlaybackInfo/PlaySessionId instead of reusing stale session data from client or proxy cache.
 
 Existing Emby users do not need to reauthenticate. The addon still reads the saved `apiKeys.embyServer`, `apiKeys.embyUserId`, and `apiKeys.embyAccessToken` fields.
+
+### Subtitle Providers
+
+OpenSubtitles v3 is enabled by default. To add SubDL as a fallback source, set `SUBDL_API_KEY` on the server or save a SubDL key in `apiKeys.subdl` through the configure UI. The key is only used server-side for lookup requests and is not appended to returned subtitle download URLs.
 
 Playback handoff defaults to signed redirect mode:
 

@@ -67,7 +67,7 @@ const subscribers = new Set<LogSubscriber>();
 // ---- redaction (strip secrets before anything is stored or streamed) ----
 const SECRET_ENV_KEYS = [
   'ADMIN_KEY', 'TMDB_API', 'BUILT_IN_TMDB_API_KEY', 'MDBLIST_API_KEY',
-  'RPDB_API_KEY', 'SIMKL_CLIENT_ID', 'SIMKL_CLIENT_SECRET',
+  'RPDB_API_KEY', 'SUBDL_API_KEY', 'SIMKL_CLIENT_ID', 'SIMKL_CLIENT_SECRET',
   'TRAKT_CLIENT_ID', 'TRAKT_CLIENT_SECRET', 'ANILIST_CLIENT_SECRET',
   'GITHUB_PAT', 'GITHUB_TOKEN',
 ];

@@ -5,7 +5,7 @@ const buildInfo = require('./buildInfo');
 const KEY_VALIDATION_STATUS_SET = new Set(['valid', 'invalid', 'timeout', 'error']);
 const isKnownKeyValidationStatus = (status) =>
   typeof status === 'string' && KEY_VALIDATION_STATUS_SET.has(status);
-const TESTABLE_API_KEY_FIELDS = new Set(['gemini', 'tmdb', 'tvdb', 'fanart', 'rpdb', 'topPoster', 'mdblist', 'openrouter', 'publicmetadb']);
+const TESTABLE_API_KEY_FIELDS = new Set(['gemini', 'tmdb', 'tvdb', 'fanart', 'rpdb', 'topPoster', 'mdblist', 'openrouter', 'publicmetadb', 'subdl']);
 const TEST_API_KEY_MAX_LENGTH = (() => {
   const parsed = parseInt(process.env.TEST_API_KEY_MAX_LENGTH || '128', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 128;
@@ -1365,6 +1365,15 @@ class ConfigApi {
       publicmetadb: async (key) => {
         const { validateKey } = require('../utils/publicmetadbUtils');
         return await validateKey(key);
+      },
+
+      subdl: async (key) => {
+        const url = `https://api.subdl.com/api/v1/me?api_key=${encodeURIComponent(key)}`;
+        const response = await serviceRequest(url, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        });
+        return response?.statusCode === 200 && response.data?.status !== false;
       },
 
       openrouter: async (key) => {

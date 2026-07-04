@@ -108,6 +108,7 @@ In **Configuration Status**, all required integrations should show **Configured*
 Save the configuration, copy the generated install URL, and install it in Stremio.
 
 The addon also exposes subtitles through the built-in OpenSubtitles v3 proxy, so you only need this one Stremio addon installed.
+Set `SUBDL_API_KEY` or save `apiKeys.subdl` in a profile to add SubDL as an additional subtitle source.
 
 ## Updating
 

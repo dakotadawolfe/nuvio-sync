@@ -151,6 +151,7 @@ const initialConfig: AppConfig = {
     topPoster: "",
     mdblist: "",
     openrouter: "",
+    subdl: "",
     publicmetadb: "",
     embyServer: "",
     embyUserId: "",

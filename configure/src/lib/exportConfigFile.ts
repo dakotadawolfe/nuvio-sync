@@ -20,6 +20,7 @@ const emptyApiKeys: AppConfig['apiKeys'] = {
   topPoster: '',
   mdblist: '',
   openrouter: '',
+  subdl: '',
   embyServer: '',
   embyUserId: '',
   embyAccessToken: '',

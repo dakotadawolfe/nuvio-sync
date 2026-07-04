@@ -438,6 +438,7 @@ const respond = function (req, res, data, opts) {
       rpdb: getSetting('RPDB_API_KEY'),
       mdblist: getSetting('MDBLIST_API_KEY'),
       gemini: getSetting('GEMINI_API_KEY'),
+      subdl: getSetting('SUBDL_API_KEY'),
       trakt: getSetting('TRAKT_CLIENT_ID'),
       simkl: getSetting('SIMKL_CLIENT_ID'),
       customDescriptionBlurb: getSetting('CUSTOM_DESCRIPTION_BLURB'),

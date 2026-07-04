@@ -80,6 +80,16 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     sensitive: true,
   },
   {
+    key: 'SUBDL_API_KEY',
+    envVar: 'SUBDL_API_KEY',
+    label: 'SubDL API Key',
+    description: 'Optional SubDL API key for additional subtitle results',
+    category: 'API Keys',
+    type: 'string',
+    default: '',
+    sensitive: true,
+  },
+  {
     key: 'GEMINI_API_KEY',
     envVar: 'GEMINI_API_KEY',
     label: 'Gemini API Key',

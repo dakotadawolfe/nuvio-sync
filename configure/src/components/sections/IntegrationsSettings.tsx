@@ -298,7 +298,7 @@ const EmbyCredentialsCard = ({ forceShow }: { forceShow?: boolean }) => {
   );
 };
 
-const visibleApiKeyFields: (keyof AppConfig['apiKeys'])[] = ['tmdb', 'tvdb', 'rpdb'];
+const visibleApiKeyFields: (keyof AppConfig['apiKeys'])[] = ['tmdb', 'tvdb', 'rpdb', 'subdl'];
 
 export function IntegrationsSettings() {
   const { config, setConfig, sessionId, setSessionId, auth } = useConfig();
@@ -738,6 +738,14 @@ export function IntegrationsSettings() {
           label="RPDB API Key"
           linkHref="https://ratingposterdb.com/"
           validationStatus={validationStatus.rpdb || 'idle'}
+          onKeyChange={handleKeyChange}
+          forceShow={showAllKeys || undefined}
+        />
+        <ApiKeyInput
+          id="subdl"
+          label="SubDL API Key"
+          linkHref="https://subdl.com/panel/api"
+          validationStatus={validationStatus.subdl || 'idle'}
           onKeyChange={handleKeyChange}
           forceShow={showAllKeys || undefined}
         />

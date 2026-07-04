@@ -243,6 +243,7 @@ export interface EnvironmentConfig {
   FANART_API_KEY?: string;
   RPDB_API_KEY?: string;
   MDBLIST_API_KEY?: string;
+  SUBDL_API_KEY?: string;
   GEMINI_API_KEY?: string;
   DATABASE_URI?: string;
   REDIS_URL?: string;

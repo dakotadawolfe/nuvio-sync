@@ -157,6 +157,7 @@ export interface AppConfig {
     topPoster: string;
     mdblist: string;
     openrouter: string;
+    subdl?: string;
     embyServer?: string;
     embyUserId?: string;
     embyAccessToken?: string;
