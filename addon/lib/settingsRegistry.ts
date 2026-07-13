@@ -941,10 +941,10 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     key: 'EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS',
     envVar: 'EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS',
     label: 'Emby Redirect Heartbeat Lease (seconds)',
-    description: 'Maximum seconds redirect mode keeps sending best-effort Emby progress heartbeats after handing the player a direct URL. Defaults to the signed stream token lifetime.',
+    description: 'Seconds redirect mode keeps sending Emby progress heartbeats after the most recent client request. A new request renews the lease; inactivity reports playback stopped.',
     category: 'Diagnostics',
     type: 'number',
-    default: 21600,
+    default: 120,
   },
 
   // --- Server (bootstrap, env-only) ---

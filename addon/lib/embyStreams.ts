@@ -14,7 +14,7 @@ const EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS = parsePositiveInt(
   process.env.EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
   parsePositiveInt(
     process.env.EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS,
-    parsePositiveInt(process.env.EMBY_STREAM_TOKEN_TTL_SECONDS, 6 * 60 * 60)
+    2 * 60
   ) * 1000
 );
 const EMBY_APP_NAME = 'AIO Addon';

@@ -632,7 +632,7 @@ test('signed playback route reports Transcode and redirects to Emby HLS URL', as
   });
 });
 
-test('redirect mode keeps the Emby session active with a bounded progress heartbeat', async () => {
+test('redirect mode renews the inactivity lease on requests and stops after silence', async () => {
   await withEnv({
     EMBY_STREAM_PROXY_MODE: 'redirect',
     EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
@@ -685,7 +685,21 @@ test('redirect mode keeps the Emby session active with a bounded progress heartb
     );
 
     assert.equal(res.redirectCode, 302);
-    await wait(60);
+    await wait(50);
+
+    await emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: {} },
+      res,
+      async () => ({
+        apiKeys: {
+          embyServer: 'https://emby.example',
+          embyUserId: 'user-1',
+          embyAccessToken: 'token-abc',
+        },
+      })
+    );
+
+    await wait(50);
 
     assert.equal(posts[0].url.pathname, '/Sessions/Playing');
     const progressPosts = posts.filter((post) => post.url.pathname === '/Sessions/Playing/Progress');
@@ -693,7 +707,9 @@ test('redirect mode keeps the Emby session active with a bounded progress heartb
     assert.equal(progressPosts[0].body.EventName, 'TimeUpdate');
     assert.equal(progressPosts[0].body.PlayMethod, 'DirectPlay');
 
-    await wait(60);
+    assert.equal(posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped').length, 0);
+
+    await wait(50);
     const stoppedPosts = posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped');
     assert.equal(stoppedPosts.length, 1);
   });

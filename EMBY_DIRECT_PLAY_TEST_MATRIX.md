@@ -10,7 +10,7 @@ Start with redirect mode:
 EMBY_STREAM_PROXY_MODE=redirect
 EMBY_DEBUG_PLAYBACK=true
 EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
-EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS=21600
+EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS=120
 ```
 
 If redirect mode still buffers or range behavior is unclear, repeat the affected rows with:
