@@ -13,6 +13,7 @@ const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
 const { getManifest, DEFAULT_LANGUAGE } = require("./lib/getManifest");
 const { getMeta } = require("./lib/getMeta");
+const bleachKai = require("./lib/bleachKai");
 const { cacheWrapMetaSmart, cacheWrapCatalog, cacheWrapSearch, cacheWrapJikanApi, cacheWrapStaticCatalog, cacheWrapGlobal, getCacheHealth, clearCacheHealth, logCacheHealth, stableStringify, deleteKeysByPattern, scanKeys } = require("./lib/getCache");
 const redis = require("./lib/redisClient");
 const { warmEssentialContent, warmPopularContent, scheduleEssentialWarming } = require("./lib/cacheWarmer");
@@ -4025,6 +4026,9 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
       userUUID,
       stremioId,
       async () => {
+        if (type === 'series' && bleachKai.isSeriesId(stremioId)) {
+          return await bleachKai.getMeta();
+        }
         return await getMeta(type, language, stremioId, fullConfig, userUUID, true);
       },
       undefined,
@@ -4221,6 +4225,11 @@ addon.get("/stremio/:userUUID/stream/:type/:id.json", async function (req, res) 
     if (!config) {
       consola.debug(`[Stream Route] No config found for user: ${userUUID}`);
       return respond(req, res, { streams: [] }, { cacheMaxAge: 0 });
+    }
+
+    if (type === 'series' && bleachKai.isVideoId(id)) {
+      const streams = await bleachKai.getStreams(id);
+      return respond(req, res, { streams }, { cacheMaxAge: 0 });
     }
 
     const { getEmbyStreams, getEmbyPlaybackClientFromRequest } = require('./lib/embyStreams');

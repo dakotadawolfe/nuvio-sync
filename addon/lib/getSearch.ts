@@ -21,6 +21,7 @@ const wikiMappings: any = require('./wiki-mapper');
 
 const logger = consola.withTag('Search');
 const timingMetrics: any = require('./timing-metrics');
+const bleachKai: any = require('./bleachKai');
 const { parse }: any = require("path");
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
 
@@ -2417,6 +2418,8 @@ async function getSearch(id: string, type: string, language: string, extra: any,
         logger.warn(`Received unknown search ID: '${id}'`);
         break;
     }
+
+    metas = bleachKai.injectSearchMeta(metas, type, queryText, page);
 
     const searchDuration = Date.now() - searchStartTime;
     logger.info(`Search completed in ${searchDuration}ms for "${queryText}" (${id})`);
