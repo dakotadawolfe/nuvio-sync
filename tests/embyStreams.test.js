@@ -632,7 +632,7 @@ test('signed playback route reports Transcode and redirects to Emby HLS URL', as
   });
 });
 
-test('redirect mode renews the inactivity lease on requests and stops after silence', async () => {
+test('redirect mode expires its heartbeat lease without stopping upstream playback', async () => {
   await withEnv({
     EMBY_STREAM_PROXY_MODE: 'redirect',
     EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
@@ -710,8 +710,17 @@ test('redirect mode renews the inactivity lease on requests and stops after sile
     assert.equal(posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped').length, 0);
 
     await wait(50);
-    const stoppedPosts = posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped');
-    assert.equal(stoppedPosts.length, 1);
+
+    assert.equal(posts.filter((post) => post.url.pathname === '/Sessions/Playing/Stopped').length, 0);
+    const progressCountAfterLeaseExpiry = posts.filter(
+      (post) => post.url.pathname === '/Sessions/Playing/Progress'
+    ).length;
+    await wait(50);
+
+    assert.equal(
+      posts.filter((post) => post.url.pathname === '/Sessions/Playing/Progress').length,
+      progressCountAfterLeaseExpiry
+    );
   });
 });
 

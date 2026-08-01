@@ -1566,7 +1566,6 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
 
     startPlaybackProgressHeartbeat(session, payload, {
       leaseMs: EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
-      stopWhenLeaseExpires: true,
     });
     res.redirect(302, playbackUrl);
   } catch (error: any) {
