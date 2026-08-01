@@ -73,6 +73,10 @@ typings/
 .env.test
 
 # Local database/cache data
+addon/data/
+*.sqlite
+*.sqlite-*
+*.db
 data/*.sqlite
 data/*.sqlite-*
 data/*.db

@@ -12,6 +12,10 @@ The configure page exposes only the pieces this instance uses:
 
 Hidden upstream options are intentionally not part of this setup.
 
+## Upstream Attribution
+
+This project is a modified, deployment-focused fork of [cedya77/aiometadata](https://github.com/cedya77/aiometadata). Original upstream work remains credited to cedya77 and its contributors. This repository is distributed under GPL-3.0-only; see [LICENSE](LICENSE).
+
 ## Default Catalogs
 
 Choosing **Start with Defaults** enables this order:
