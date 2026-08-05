@@ -564,6 +564,83 @@ test('signed playback route reports Sessions/Playing and redirects to final stat
   });
 });
 
+test('redirect playback does not wait for Sessions/Playing telemetry', async () => {
+  await withEnv({
+    EMBY_STREAM_PROXY_MODE: 'redirect',
+    EMBY_STREAM_SIGNING_SECRET: 'unit-test-stream-secret',
+    EMBY_PLAYBACK_PROGRESS_INTERVAL_MS: '1000',
+    EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS: '50',
+  }, async () => {
+    let releasePlaybackStarted;
+    const playbackStartedGate = new Promise((resolve) => {
+      releasePlaybackStarted = resolve;
+    });
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async (url, body, options) => {
+        const parsed = new URL(url);
+        posts.push({ url: parsed, body, options });
+        if (parsed.pathname === '/Sessions/Playing') {
+          await playbackStartedGate;
+        }
+        return { data: {}, status: 204 };
+      },
+    });
+
+    const signedToken = emby.signEmbyStreamToken({
+      userUUID: 'addon-user-1',
+      itemId: 'item-1',
+      mediaSourceId: 'media-source-1',
+      playSessionId: 'play-session-1',
+      container: 'mkv',
+      ext: 'mkv',
+      expiresAt: Date.now() + 60_000,
+    });
+    const res = {
+      redirectCode: null,
+      redirectUrl: null,
+      status() {
+        return this;
+      },
+      json() {
+        return this;
+      },
+      redirect(code, url) {
+        this.redirectCode = code;
+        this.redirectUrl = url;
+        return this;
+      },
+    };
+
+    const request = emby.handleSignedEmbyStreamRequest(
+      { params: { signedToken }, headers: {} },
+      res,
+      async () => ({
+        apiKeys: {
+          embyServer: 'https://emby.example',
+          embyUserId: 'user-1',
+          embyAccessToken: 'token-abc',
+        },
+      })
+    );
+
+    try {
+      const outcome = await Promise.race([
+        request.then(() => 'redirected'),
+        wait(50).then(() => 'timed-out'),
+      ]);
+
+      assert.equal(outcome, 'redirected');
+      assert.equal(res.redirectCode, 302);
+      assert.equal(posts[0].url.pathname, '/Sessions/Playing');
+      assert.equal(posts[0].options.timeout, 2000);
+    } finally {
+      releasePlaybackStarted();
+      await request;
+    }
+  });
+});
+
 test('signed playback route reports Transcode and redirects to Emby HLS URL', async () => {
   await withEnv({
     EMBY_STREAM_PROXY_MODE: 'proxy',

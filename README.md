@@ -99,7 +99,7 @@ EMBY_STREAM_PROXY_MODE=redirect
 
 Modes:
 
-- `redirect`: returns an addon-owned signed URL, reports `/Sessions/Playing` when Stremio/Nuvio requests it, starts a bounded `/Sessions/Playing/Progress` heartbeat, then redirects to Emby.
+- `redirect`: returns an addon-owned signed URL, reports `/Sessions/Playing` without delaying the redirect, starts a bounded `/Sessions/Playing/Progress` heartbeat, then redirects to Emby.
 - `proxy`: uses the same signed URL, reports playback start, forwards `Range` requests and upstream `206`/range headers through the addon, sends progress heartbeats while the proxy connection is active, and sends best-effort stopped reporting when the connection closes.
 - `off`: returns the direct Emby static URL without addon playback reporting.
 
@@ -111,6 +111,7 @@ Optional diagnostics:
 EMBY_DEBUG_PLAYBACK=true
 EMBY_STREAM_SIGNING_SECRET=replace-with-stable-server-secret
 EMBY_STREAM_STOP_DEBOUNCE_MS=1500
+EMBY_PLAYBACK_EVENT_TIMEOUT_MS=2000
 EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS=120
 EMBY_DIRECT_PLAY_AUDIO_CODECS=aac,mp3,ac3,eac3,opus,flac
@@ -120,4 +121,4 @@ Core playback decisions are logged with redacted URL/token fields. `EMBY_DEBUG_P
 
 If `EMBY_STREAM_SIGNING_SECRET` is not set, the addon derives a stable signing secret from existing server-only secrets such as `ADDON_PASSWORD`, `ADMIN_KEY`, or `DATABASE_URI`. If none are available, only newly generated signed playback URLs expire on restart; saved Emby auth is not changed.
 
-Stremio direct URL playback does not expose full native player pause, seek, and stop callbacks to this addon. Redirect mode reports playback start and keeps the Emby session active while the client continues requesting the signed stream URL. Each request renews a bounded inactivity lease; after 120 seconds without another request by default, the addon sends `Sessions/Playing/Stopped`. Proxy mode adds connection-close stopped reporting and range/response diagnostics, at the cost of routing video traffic through the addon server. Proxy mode follows upstream Emby redirects while preserving `Range` headers. `EMBY_STREAM_STOP_DEBOUNCE_MS` controls how long proxy mode waits before reporting stopped, which avoids false stops during byte-range switches. `EMBY_PLAYBACK_PROGRESS_INTERVAL_MS` controls progress heartbeat frequency. `EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS` controls the redirect-mode inactivity timeout. The addon derives a hashed playback-client id from request metadata for Emby DeviceId separation without storing raw IP or User-Agent values in signed URLs.
+Stremio direct URL playback does not expose full native player pause, seek, and stop callbacks to this addon. Redirect mode reports playback start as best-effort telemetry without delaying the player, then keeps the Emby session active while the client continues requesting the signed stream URL. Each request renews a bounded inactivity lease; after 120 seconds without another request by default, the addon stops its synthetic progress heartbeat without stopping the upstream playback session. Proxy mode adds connection-close stopped reporting and range/response diagnostics, at the cost of routing video traffic through the addon server. Proxy mode follows upstream Emby redirects while preserving `Range` headers. `EMBY_STREAM_STOP_DEBOUNCE_MS` controls how long proxy mode waits before reporting stopped, which avoids false stops during byte-range switches. `EMBY_PLAYBACK_EVENT_TIMEOUT_MS` limits each best-effort Emby playback event without changing stream lookup or proxy timeouts. `EMBY_PLAYBACK_PROGRESS_INTERVAL_MS` controls progress heartbeat frequency. `EMBY_REDIRECT_PLAYBACK_HEARTBEAT_SECONDS` controls the redirect-mode inactivity timeout. The addon derives a hashed playback-client id from request metadata for Emby DeviceId separation without storing raw IP or User-Agent values in signed URLs.

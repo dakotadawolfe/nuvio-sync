@@ -7,6 +7,7 @@ const { httpGet, httpPost }: any = require('../utils/httpClient');
 
 const logger: any = consola.withTag('EmbyStreams');
 const EMBY_TIMEOUT_MS = parsePositiveInt(process.env.EMBY_TIMEOUT_MS, 10000);
+const EMBY_PLAYBACK_EVENT_TIMEOUT_MS = parsePositiveInt(process.env.EMBY_PLAYBACK_EVENT_TIMEOUT_MS, 2000);
 const EMBY_ITEM_CACHE_TTL_MS = parsePositiveInt(process.env.EMBY_ITEM_CACHE_TTL_SECONDS, 5 * 60) * 1000;
 const EMBY_STREAM_TOKEN_TTL_MS = parsePositiveInt(process.env.EMBY_STREAM_TOKEN_TTL_SECONDS, 6 * 60 * 60) * 1000;
 const EMBY_PLAYBACK_PROGRESS_INTERVAL_MS = parsePositiveInt(process.env.EMBY_PLAYBACK_PROGRESS_INTERVAL_MS, 30_000);
@@ -1159,7 +1160,7 @@ async function postPlaybackEvent(session: EmbySession, endpoint: string, payload
       }),
       payload,
       {
-        timeout: EMBY_TIMEOUT_MS,
+        timeout: EMBY_PLAYBACK_EVENT_TIMEOUT_MS,
         headers: embyHeaders(session, {
           Accept: 'application/json',
         }),
@@ -1533,7 +1534,7 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
       return;
     }
 
-    await reportPlaybackStarted(session, payload);
+    void reportPlaybackStarted(session, payload);
     const playbackUrl = buildPlaybackUrlFromPayload(session, payload);
     const mode = getEmbyStreamProxyMode();
     const effectiveMode = payload.playMethod === 'Transcode' && mode === 'proxy' ? 'redirect' : mode;
