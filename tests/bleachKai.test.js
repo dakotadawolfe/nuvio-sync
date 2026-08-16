@@ -39,6 +39,32 @@ test('uses an existing manifest prefix and translates episode IDs', () => {
   assert.equal(bleachKai.isVideoId('tvdb:bleach-kai:1:12'), true);
 });
 
+test('returns the matching hosted English subtitle for each Bleach Kai episode', () => {
+  assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:1:9'), {
+    subtitles: [{
+      id: 'bleach-kai-en-09',
+      url: 'https://example.com/bleach/subtitles/episode-09.en.srt',
+      lang: 'eng',
+      title: 'English (Bleach Kai)',
+    }],
+  });
+
+  assert.deepEqual(bleachKai.getSubtitles('bleach-kai:1:35'), {
+    subtitles: [{
+      id: 'bleach-kai-en-35',
+      url: 'https://example.com/bleach/subtitles/episode-35.en.srt',
+      lang: 'eng',
+      title: 'English (Bleach Kai)',
+    }],
+  });
+});
+
+test('does not return Bleach Kai subtitles for malformed or out-of-range IDs', () => {
+  assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:2:1'), { subtitles: [] });
+  assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:1:36'), { subtitles: [] });
+  assert.deepEqual(bleachKai.getSubtitles('tt0434665:1:1'), { subtitles: [] });
+});
+
 test('stays disabled when the private upstream is not configured', () => {
   delete process.env.BLEACH_KAI_ADDON_BASE_URL;
   assert.deepEqual(bleachKai.injectSearchMeta([], 'series', 'bleach kai', 1), []);

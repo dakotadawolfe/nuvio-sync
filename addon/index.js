@@ -4346,6 +4346,10 @@ addon.get("/stremio/:userUUID/subtitles/:type/:id{/:extra}.json", async function
       consola.debug(`[Watch Tracking] Skipped for user ${userUUID} - mdblist: ${shouldTrackMdblist}, anilist: ${shouldTrackAnilist}, simkl: ${shouldTrackSimkl}, trakt: ${shouldTrackTrakt}`);
     }
 
+    if (type === 'series' && bleachKai.isVideoId(id)) {
+      return respond(req, res, bleachKai.getSubtitles(id), { cacheMaxAge: 86400 });
+    }
+
     const { fetchOpenSubtitles } = require('./lib/openSubtitlesProxy');
     const queryIndex = req.originalUrl.indexOf('?');
     const queryString = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : '';

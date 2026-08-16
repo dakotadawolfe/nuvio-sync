@@ -2,6 +2,7 @@ const PUBLIC_ID = 'tvdb:bleach-kai';
 const UPSTREAM_ID = 'bleach-kai';
 const SERIES_TYPE = 'series';
 const REQUEST_TIMEOUT_MS = 10000;
+const EPISODE_COUNT = 35;
 
 function getBaseUrl() {
   const value = String(process.env.BLEACH_KAI_ADDON_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -50,6 +51,34 @@ function matchesSearch(type, query, page = 1) {
 function getArtworkOrigin() {
   const baseUrl = getBaseUrl();
   return baseUrl ? new URL(baseUrl).origin : '';
+}
+
+function getEpisodeNumber(id) {
+  if (typeof id !== 'string') return null;
+
+  const match = id.match(/^(?:tvdb:bleach-kai|bleach-kai):1:(\d+)$/);
+  if (!match) return null;
+
+  const episode = Number(match[1]);
+  return Number.isInteger(episode) && episode >= 1 && episode <= EPISODE_COUNT
+    ? episode
+    : null;
+}
+
+function getSubtitles(id) {
+  const episode = getEpisodeNumber(id);
+  const origin = getArtworkOrigin();
+  if (!episode || !origin) return { subtitles: [] };
+
+  const paddedEpisode = String(episode).padStart(2, '0');
+  return {
+    subtitles: [{
+      id: `bleach-kai-en-${paddedEpisode}`,
+      url: `${origin}/bleach/subtitles/episode-${paddedEpisode}.en.srt`,
+      lang: 'eng',
+      title: 'English (Bleach Kai)',
+    }],
+  };
 }
 
 function getSearchMeta() {
@@ -131,6 +160,7 @@ module.exports = {
   PUBLIC_ID,
   getMeta,
   getStreams,
+  getSubtitles,
   injectSearchMeta,
   isEnabled,
   isSeriesId,
