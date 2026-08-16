@@ -4,9 +4,11 @@ const test = require('node:test');
 const bleachKai = require('../addon/lib/bleachKai');
 
 const originalBaseUrl = process.env.BLEACH_KAI_ADDON_BASE_URL;
+const originalFilesBaseUrl = process.env.BLEACH_KAI_FILES_BASE_URL;
 
 test.beforeEach(() => {
   process.env.BLEACH_KAI_ADDON_BASE_URL = 'https://example.com/private-token';
+  delete process.env.BLEACH_KAI_FILES_BASE_URL;
 });
 
 test.after(() => {
@@ -14,6 +16,11 @@ test.after(() => {
     delete process.env.BLEACH_KAI_ADDON_BASE_URL;
   } else {
     process.env.BLEACH_KAI_ADDON_BASE_URL = originalBaseUrl;
+  }
+  if (originalFilesBaseUrl === undefined) {
+    delete process.env.BLEACH_KAI_FILES_BASE_URL;
+  } else {
+    process.env.BLEACH_KAI_FILES_BASE_URL = originalFilesBaseUrl;
   }
 });
 
@@ -63,6 +70,15 @@ test('does not return Bleach Kai subtitles for malformed or out-of-range IDs', (
   assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:2:1'), { subtitles: [] });
   assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:1:36'), { subtitles: [] });
   assert.deepEqual(bleachKai.getSubtitles('tt0434665:1:1'), { subtitles: [] });
+});
+
+test('uses the configured Bleach Kai file host for subtitles', () => {
+  process.env.BLEACH_KAI_FILES_BASE_URL = 'https://files.example.com/custom/bleach/';
+
+  assert.equal(
+    bleachKai.getSubtitles('tvdb:bleach-kai:1:1').subtitles[0].url,
+    'https://files.example.com/custom/bleach/subtitles/episode-01.en.srt',
+  );
 });
 
 test('stays disabled when the private upstream is not configured', () => {

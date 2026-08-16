@@ -53,6 +53,23 @@ function getArtworkOrigin() {
   return baseUrl ? new URL(baseUrl).origin : '';
 }
 
+function getFilesBaseUrl() {
+  const configuredValue = String(process.env.BLEACH_KAI_FILES_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (configuredValue) {
+    try {
+      const url = new URL(configuredValue);
+      if (url.protocol === 'https:' || url.protocol === 'http:') {
+        return url.toString().replace(/\/+$/, '');
+      }
+    } catch {
+      // Fall back to the add-on origin for existing installations.
+    }
+  }
+
+  const origin = getArtworkOrigin();
+  return origin ? `${origin}/bleach` : '';
+}
+
 function getEpisodeNumber(id) {
   if (typeof id !== 'string') return null;
 
@@ -67,14 +84,14 @@ function getEpisodeNumber(id) {
 
 function getSubtitles(id) {
   const episode = getEpisodeNumber(id);
-  const origin = getArtworkOrigin();
-  if (!episode || !origin) return { subtitles: [] };
+  const filesBaseUrl = getFilesBaseUrl();
+  if (!episode || !filesBaseUrl) return { subtitles: [] };
 
   const paddedEpisode = String(episode).padStart(2, '0');
   return {
     subtitles: [{
       id: `bleach-kai-en-${paddedEpisode}`,
-      url: `${origin}/bleach/subtitles/episode-${paddedEpisode}.en.srt`,
+      url: `${filesBaseUrl}/subtitles/episode-${paddedEpisode}.en.srt`,
       lang: 'eng',
       title: 'English (Bleach Kai)',
     }],
