@@ -1,4 +1,5 @@
-const PUBLIC_ID = 'tvdb:bleach-kai';
+const PUBLIC_ID = 'tvdb:bleach-kai-v2';
+const LEGACY_PUBLIC_ID = 'tvdb:bleach-kai';
 const UPSTREAM_ID = 'bleach-kai';
 const SERIES_TYPE = 'series';
 const REQUEST_TIMEOUT_MS = 10000;
@@ -22,12 +23,16 @@ function isEnabled() {
 }
 
 function isSeriesId(id) {
-  return id === PUBLIC_ID || id === UPSTREAM_ID;
+  return id === PUBLIC_ID || id === LEGACY_PUBLIC_ID || id === UPSTREAM_ID;
 }
 
 function isVideoId(id) {
   return typeof id === 'string'
-    && (id.startsWith(`${PUBLIC_ID}:`) || id.startsWith(`${UPSTREAM_ID}:`));
+    && (
+      id.startsWith(`${PUBLIC_ID}:`)
+      || id.startsWith(`${LEGACY_PUBLIC_ID}:`)
+      || id.startsWith(`${UPSTREAM_ID}:`)
+    );
 }
 
 function normalizeSearchQuery(query) {
@@ -73,7 +78,7 @@ function getFilesBaseUrl() {
 function getEpisodeNumber(id) {
   if (typeof id !== 'string') return null;
 
-  const match = id.match(/^(?:tvdb:bleach-kai|bleach-kai):1:(\d+)$/);
+  const match = id.match(/^(?:tvdb:bleach-kai-v2|tvdb:bleach-kai|bleach-kai):1:(\d+)$/);
   if (!match) return null;
 
   const episode = Number(match[1]);
@@ -145,6 +150,9 @@ function toUpstreamVideoId(id) {
   if (typeof id !== 'string') return null;
   if (id.startsWith(`${PUBLIC_ID}:`)) {
     return `${UPSTREAM_ID}${id.slice(PUBLIC_ID.length)}`;
+  }
+  if (id.startsWith(`${LEGACY_PUBLIC_ID}:`)) {
+    return `${UPSTREAM_ID}${id.slice(LEGACY_PUBLIC_ID.length)}`;
   }
   return id.startsWith(`${UPSTREAM_ID}:`) ? id : null;
 }

@@ -28,7 +28,7 @@ test('injects Bleach Kai into matching first-page series searches', () => {
   const existing = [{ id: 'tt0434665', type: 'series', name: 'Bleach' }];
   const result = bleachKai.injectSearchMeta(existing, 'series', 'bleach', 1);
 
-  assert.equal(result[0].id, 'tvdb:bleach-kai');
+  assert.equal(result[0].id, 'tvdb:bleach-kai-v2');
   assert.equal(result[0].name, 'Bleach Kai');
   assert.deepEqual(result.slice(1), existing);
 });
@@ -40,9 +40,12 @@ test('does not inject into unrelated, movie, or later-page searches', () => {
 });
 
 test('uses an existing manifest prefix and translates episode IDs', () => {
-  assert.equal(bleachKai.toPublicVideoId('bleach-kai:1:12'), 'tvdb:bleach-kai:1:12');
+  assert.equal(bleachKai.toPublicVideoId('bleach-kai:1:12'), 'tvdb:bleach-kai-v2:1:12');
+  assert.equal(bleachKai.toUpstreamVideoId('tvdb:bleach-kai-v2:1:12'), 'bleach-kai:1:12');
   assert.equal(bleachKai.toUpstreamVideoId('tvdb:bleach-kai:1:12'), 'bleach-kai:1:12');
+  assert.equal(bleachKai.isSeriesId('tvdb:bleach-kai-v2'), true);
   assert.equal(bleachKai.isSeriesId('tvdb:bleach-kai'), true);
+  assert.equal(bleachKai.isVideoId('tvdb:bleach-kai-v2:1:12'), true);
   assert.equal(bleachKai.isVideoId('tvdb:bleach-kai:1:12'), true);
 });
 
@@ -67,6 +70,7 @@ test('returns the matching hosted English subtitle for each Bleach Kai episode',
 });
 
 test('does not return Bleach Kai subtitles for malformed or out-of-range IDs', () => {
+  assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai-v2:2:1'), { subtitles: [] });
   assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:2:1'), { subtitles: [] });
   assert.deepEqual(bleachKai.getSubtitles('tvdb:bleach-kai:1:36'), { subtitles: [] });
   assert.deepEqual(bleachKai.getSubtitles('tt0434665:1:1'), { subtitles: [] });
