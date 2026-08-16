@@ -4315,7 +4315,7 @@ addon.get("/stremio/:userUUID/subtitles/:type/:id{/:extra}.json", async function
   consola.debug(`[Watch Tracking] Subtitle route matched - userUUID: ${userUUID}, type: ${type}, id: ${id}, extra: ${extra || 'none'}`);
 
   if (type === 'series' && bleachKai.isVideoId(id)) {
-    return respond(req, res, bleachKai.getSubtitles(id), { cacheMaxAge: 86400 });
+    return respond(req, res, bleachKai.getSubtitles(id), { cacheMaxAge: 0 });
   }
   
   try {
