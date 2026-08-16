@@ -4313,6 +4313,10 @@ addon.get("/stremio/:userUUID/subtitles/:type/:id{/:extra}.json", async function
   
   // Debug logging for all watch tracking attempts with media ID and user UUID
   consola.debug(`[Watch Tracking] Subtitle route matched - userUUID: ${userUUID}, type: ${type}, id: ${id}, extra: ${extra || 'none'}`);
+
+  if (type === 'series' && bleachKai.isVideoId(id)) {
+    return respond(req, res, bleachKai.getSubtitles(id), { cacheMaxAge: 86400 });
+  }
   
   try {
     // Load config from database
@@ -4344,10 +4348,6 @@ addon.get("/stremio/:userUUID/subtitles/:type/:id{/:extra}.json", async function
       handleSubtitleRequest(type, id, config, userUUID);
     } else {
       consola.debug(`[Watch Tracking] Skipped for user ${userUUID} - mdblist: ${shouldTrackMdblist}, anilist: ${shouldTrackAnilist}, simkl: ${shouldTrackSimkl}, trakt: ${shouldTrackTrakt}`);
-    }
-
-    if (type === 'series' && bleachKai.isVideoId(id)) {
-      return respond(req, res, bleachKai.getSubtitles(id), { cacheMaxAge: 86400 });
     }
 
     const { fetchOpenSubtitles } = require('./lib/openSubtitlesProxy');
