@@ -1035,7 +1035,7 @@ test('proxy mode follows upstream redirects while preserving Range', async () =>
   });
 });
 
-test('DTS original comes first with a separate compatibility session and no forced subtitle burn-in', async () => {
+test('DTS original does not wait for compatibility and HEAD probes reuse negotiation without starting playback', async () => {
   await withEnv({ HOST_NAME: 'https://addon.example', EMBY_STREAM_PROXY_MODE: 'redirect', EMBY_STREAM_SIGNING_SECRET: 'test-secret', EMBY_DIRECT_PLAY_AUDIO_CODECS: undefined }, async () => {
     const posts = [];
     const emby = loadEmbyStreamsWithMocks({
@@ -1066,21 +1066,38 @@ test('DTS original comes first with a separate compatibility session and no forc
     assert.equal(result.streams.length, 2);
     assert.match(result.streams[0].name, /Original/);
     assert.match(result.streams[1].name, /Compatibility/);
+    assert.equal(posts.length, 1);
     assert.match(posts[0].DeviceProfile.DirectPlayProfiles[0].AudioCodec, /\bdts\b/);
+    const compatibilityToken = new URL(result.streams[1].url).pathname.split('/')[3];
+    const res = {
+      headers: {},
+      setHeader(k, v) { this.headers[k] = v; },
+      redirect(status, url) { this.statusCode = status; this.url = url; },
+    };
+    const loadConfig = async () => ({ apiKeys: { embyServer: session.serverUrl, embyUserId: session.userId, embyAccessToken: session.accessToken } });
+    await emby.handleSignedEmbyStreamRequest({ method: 'HEAD', params: { signedToken: compatibilityToken }, headers: {} }, res, loadConfig);
+    assert.equal(res.statusCode, 302);
+    assert.match(res.headers['Cache-Control'], /no-store/);
+    assert.equal(posts.length, 2);
+    await emby.handleSignedEmbyStreamRequest({ method: 'HEAD', params: { signedToken: compatibilityToken }, headers: {} }, res, loadConfig);
+    assert.equal(posts.length, 2);
     assert.doesNotMatch(posts[1].DeviceProfile.DirectPlayProfiles[0].AudioCodec, /\bdts\b/);
     assert.equal(posts[1].MediaSourceId, 'media-source-1');
     assert.equal(posts[1].AudioStreamIndex, 1);
     assert.ok(posts.every(body => body.SubtitleStreamIndex === -1));
     const payloads = result.streams.map(stream => emby.verifySignedEmbyStreamToken(new URL(stream.url).pathname.split('/')[3]));
     assert.deepEqual(payloads.map(p => p.playMethod), ['DirectPlay', 'Transcode']);
-    assert.deepEqual(payloads.map(p => p.playSessionId), ['original-session', 'compat-session']);
+    assert.notEqual(payloads[0].playSessionId, payloads[1].playSessionId);
+    assert.equal(payloads[1].compatibility, true);
+    assert.equal(payloads[1].transcodingUrlPath, undefined);
     assert.ok(payloads.every(p => p.subtitleStreamIndex === -1));
     const original = new URL(emby.buildPlaybackUrlFromPayload(session, payloads[0]));
     assert.equal(original.pathname, '/Videos/item-1/stream.mkv');
     assert.equal(original.searchParams.get('static'), 'true');
-    const compatibility = new URL(emby.buildPlaybackUrlFromPayload(session, payloads[1]));
+    const compatibility = new URL(res.url);
     assert.equal(compatibility.searchParams.get('AudioCodec'), 'aac');
     assert.equal(compatibility.searchParams.get('SubtitleStreamIndex'), '-1');
+    assert.equal(compatibility.searchParams.get('PlaySessionId'), 'compat-session');
   });
 });
 
@@ -1112,4 +1129,46 @@ test('PlaybackInfo GET fallback also disables server-selected subtitles', async 
   });
   await emby.getPlaybackInfo({ serverUrl: 'https://emby.example', accessToken: 'token-abc', userId: 'user-1' }, 'item-1');
   assert.equal(calls[0].searchParams.get('SubtitleStreamIndex'), '-1');
+});
+
+test('original HEAD handoff is private and does not send playback events', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'redirect', EMBY_STREAM_SIGNING_SECRET: 'head-secret' }, async () => {
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({ httpPost: async (...args) => { posts.push(args); return { data: {} }; } });
+    const signedToken = emby.signEmbyStreamToken({ userUUID: 'addon-user-1', itemId: 'item-1', mediaSourceId: 'source-1', playSessionId: 'session-1', container: 'mkv', ext: 'mkv', subtitleStreamIndex: -1 });
+    const res = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, redirect(status, url) { this.statusCode = status; this.url = url; } };
+    await emby.handleSignedEmbyStreamRequest({ method: 'HEAD', params: { signedToken }, headers: {} }, res, async () => ({ apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'token-abc' } }));
+    assert.equal(res.statusCode, 302);
+    assert.equal(new URL(res.url).searchParams.get('static'), 'true');
+    assert.match(res.headers['Cache-Control'], /no-store/);
+    assert.equal(posts.length, 0);
+  });
+});
+
+test('proxy HEAD requests preserve the method and do not start or stop playback', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'proxy', EMBY_STREAM_SIGNING_SECRET: 'head-secret' }, async () => {
+    const requests = [], posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpPost: async (...args) => { posts.push(args); return { data: {} }; },
+      undiciRequest: async (url, options) => { requests.push(options); return { statusCode: 200, headers: { 'content-length': '1234', 'cache-control': 'public, max-age=3600' }, body: Readable.from([]) }; },
+    });
+    const signedToken = emby.signEmbyStreamToken({ userUUID: 'addon-user-1', itemId: 'item-1', mediaSourceId: 'source-1', playSessionId: 'session-1', container: 'mkv', ext: 'mkv' });
+    const res = makeWritableResponse();
+    await emby.handleSignedEmbyStreamRequest({ method: 'HEAD', params: { signedToken }, headers: {} }, res, async () => ({ apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'token-abc' } }));
+    assert.equal(requests[0].method, 'HEAD');
+    assert.equal(res.headers['content-length'], '1234');
+    assert.match(res.headers['cache-control'], /no-store/);
+    assert.equal(posts.length, 0);
+  });
+});
+
+test('a known database path cannot be used to forge playback tokens', async () => {
+  await withEnv({ EMBY_STREAM_SIGNING_SECRET: undefined, STREAM_SIGNING_SECRET: undefined, ADDON_PASSWORD: undefined, ADMIN_KEY: undefined, DATABASE_URI: 'sqlite://addon/data/db.sqlite' }, async () => {
+    const crypto = require('node:crypto');
+    const emby = loadEmbyStreamsWithMocks();
+    const body = Buffer.from(JSON.stringify({ userUUID: 'victim', itemId: 'item-1', expiresAt: Date.now() + 60_000 })).toString('base64url');
+    const oldKey = crypto.createHash('sha256').update('emby-stream:database:sqlite://addon/data/db.sqlite').digest('hex');
+    const signature = crypto.createHmac('sha256', oldKey).update(body).digest('base64url');
+    assert.throws(() => emby.verifySignedEmbyStreamToken(`${body}.${signature}`), /signature/);
+  });
 });

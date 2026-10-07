@@ -6,5 +6,12 @@ Dockerfile
 .env
 dist
 addon/data
+data
+redis-data
+logs
+*.log
+*.tar.gz
+.env.*
+!.env.example
 .next
 .cache

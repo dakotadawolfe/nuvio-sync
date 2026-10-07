@@ -40,7 +40,6 @@ const SAFE_PROXY_HEADERS = [
   'content-type',
   'etag',
   'last-modified',
-  'cache-control',
 ];
 
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
@@ -138,6 +137,7 @@ interface SignedStreamPayload {
   ext: string;
   playMethod?: 'DirectPlay' | 'DirectStream' | 'Transcode';
   transcodingUrlPath?: string;
+  compatibility?: boolean;
   audioStreamIndex?: number;
   subtitleStreamIndex?: number;
   playbackClientId?: string;
@@ -908,10 +908,6 @@ function getStreamSigningSecret(): string {
   if (process.env.ADMIN_KEY) {
     return crypto.createHash('sha256').update(`emby-stream:admin:${process.env.ADMIN_KEY}`).digest('hex');
   }
-  if (process.env.DATABASE_URI) {
-    return crypto.createHash('sha256').update(`emby-stream:database:${process.env.DATABASE_URI}`).digest('hex');
-  }
-
   if (!warnedEphemeralSigningSecret) {
     warnedEphemeralSigningSecret = true;
     logger.warn('[Emby] EMBY_STREAM_SIGNING_SECRET is not set and no server-only secret was available; signed playback URLs will expire on restart but saved Emby auth is not affected.');
@@ -1062,9 +1058,9 @@ function schedulePlaybackStopped(session: EmbySession, payload: SignedStreamPayl
   playbackStopDebounces.set(key, timer);
 }
 
-async function requestProxyStreamWithRedirects(url: string, headers: Record<string, string>, redirectsRemaining = 3): Promise<any> {
+async function requestProxyStreamWithRedirects(url: string, headers: Record<string, string>, redirectsRemaining = 3, method = 'GET'): Promise<any> {
   const upstream = await undiciRequest(url, {
-    method: 'GET',
+    method,
     headers,
     bodyTimeout: 0,
     headersTimeout: EMBY_TIMEOUT_MS,
@@ -1074,7 +1070,7 @@ async function requestProxyStreamWithRedirects(url: string, headers: Record<stri
   if (redirectsRemaining > 0 && REDIRECT_STATUS_CODES.has(upstream.statusCode) && locationHeader) {
     upstream.body?.destroy?.();
     const nextUrl = new URL(locationHeader, url).toString();
-    return requestProxyStreamWithRedirects(nextUrl, headers, redirectsRemaining - 1);
+    return requestProxyStreamWithRedirects(nextUrl, headers, redirectsRemaining - 1, method);
   }
 
   return upstream;
@@ -1090,6 +1086,7 @@ function buildSignedAddonStreamUrl(
     playMethod?: 'DirectPlay' | 'DirectStream' | 'Transcode';
     transcodingUrlPath?: string;
     ext?: string;
+    compatibility?: boolean;
   } = {}
 ): string | null {
   const addonHost = getAddonHost();
@@ -1108,6 +1105,7 @@ function buildSignedAddonStreamUrl(
     ext,
     playMethod: options.playMethod || 'DirectPlay',
     transcodingUrlPath: options.transcodingUrlPath,
+    compatibility: options.compatibility,
     audioStreamIndex: streamIndexes.audioStreamIndex,
     subtitleStreamIndex: streamIndexes.subtitleStreamIndex,
     playbackClientId: session.playbackClientId,
@@ -1251,6 +1249,7 @@ function toEmbyStream(
   playbackOptions: {
     playMethod?: 'DirectPlay' | 'DirectStream' | 'Transcode';
     transcodingUrlPath?: string;
+    compatibility?: boolean;
   } = {}
 ): any {
   const playMethod = playbackOptions.playMethod || 'DirectPlay';
@@ -1281,6 +1280,7 @@ function toEmbyStream(
     ext: extension,
     playMethod,
     transcodingUrlPath: playbackOptions.transcodingUrlPath,
+    compatibility: playbackOptions.compatibility,
     audioStreamIndex,
     subtitleStreamIndex,
     playbackClientId: session.playbackClientId,
@@ -1295,6 +1295,7 @@ function toEmbyStream(
     playMethod,
     transcodingUrlPath: playbackOptions.transcodingUrlPath,
     ext: extension,
+    compatibility: playbackOptions.compatibility,
   });
   const url = signedUrl || directUrl;
   const notWebReady = !isWebReadyPlayback({ serverUrl: session.serverUrl, container, ext: extension, playMethod });
@@ -1384,6 +1385,22 @@ async function toPlaybackAwareEmbyStream(session: EmbySession, item: EmbyItem): 
     const audio = getMediaStreams(item, directSource).find((stream) => stream.Type?.toLowerCase() === 'audio' && stream.Index === audioIndex);
     if (audio?.Codec?.toLowerCase() === 'dts') {
       directStream.name = 'Emby · Original';
+      if (directSource.SupportsTranscoding === false) {
+        return directStream;
+      }
+      if (getEmbyStreamProxyMode() !== 'off' && getAddonHost() && session.userUUID) {
+        const compatibilityStream = toEmbyStream(session, item, {
+          ...directSource,
+          TranscodingSubProtocol: 'hls',
+          TranscodingContainer: 'ts',
+        }, generateFallbackPlaySessionId(session, item.Id, mediaSourceId), {
+          playMethod: 'Transcode',
+          compatibility: true,
+        });
+        compatibilityStream.name = 'Emby · Compatibility';
+        compatibilityStream.description = `Use if the original has no sound.\n${compatibilityStream.description}`;
+        return [directStream, compatibilityStream];
+      }
       try {
         const compatibilityInfo = await getPlaybackInfo(session, item.Id, {
           MediaSourceId: mediaSourceId,
@@ -1505,8 +1522,8 @@ async function proxyEmbyStream(req: any, res: any, session: EmbySession, payload
     headers.Range = req.headers.range;
   }
 
-  const upstream = await requestProxyStreamWithRedirects(directUrl, headers);
-  startPlaybackProgressHeartbeat(session, payload);
+  const isHead = req.method === 'HEAD';
+  const upstream = await requestProxyStreamWithRedirects(directUrl, headers, 3, isHead ? 'HEAD' : 'GET');
 
   res.status(upstream.statusCode);
   for (const header of SAFE_PROXY_HEADERS) {
@@ -1514,6 +1531,16 @@ async function proxyEmbyStream(req: any, res: any, session: EmbySession, payload
     if (value !== undefined) {
       res.setHeader(header, value);
     }
+  }
+
+  if (isHead) {
+    upstream.body?.destroy?.();
+    res.end();
+    return;
+  }
+  if (upstream.statusCode >= 200 && upstream.statusCode < 300) {
+    void reportPlaybackStarted(session, payload);
+    startPlaybackProgressHeartbeat(session, payload);
   }
 
   debugPlayback('proxy-response', {
@@ -1548,9 +1575,11 @@ async function proxyEmbyStream(req: any, res: any, session: EmbySession, payload
 }
 
 async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromDatabase: (userUUID: string) => Promise<any>): Promise<void> {
+  res.setHeader?.('Cache-Control', 'private, no-store, max-age=0');
+  res.setHeader?.('Referrer-Policy', 'no-referrer');
   try {
     const signedToken = req.params?.signedToken;
-    const payload = verifySignedEmbyStreamToken(signedToken);
+    let payload = verifySignedEmbyStreamToken(signedToken);
     const config = await loadConfigFromDatabase(payload.userUUID);
     const requestPlaybackClient = getEmbyPlaybackClientFromRequest(req);
     const session = await getEmbySession({
@@ -1565,7 +1594,31 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
       return;
     }
 
-    void reportPlaybackStarted(session, payload);
+    if (payload.compatibility) {
+      const cacheKey = `compatibility:${hashCacheKey(signedToken)}`;
+      const cached = getCached<SignedStreamPayload>(itemCache, cacheKey);
+      if (cached) {
+        payload = cached;
+      } else {
+        const info = await getPlaybackInfo(session, payload.itemId, {
+          MediaSourceId: payload.mediaSourceId,
+          AudioStreamIndex: payload.audioStreamIndex,
+          EnableDirectPlay: false,
+        }, buildNuvioDeviceProfile(false));
+        const source = selectTranscodingSource((info.MediaSources || []).filter((candidate) => candidate.Id === payload.mediaSourceId));
+        const transcodingUrlPath = sanitizeTranscodingUrlPath(source?.TranscodingUrl);
+        if (!source || !transcodingUrlPath) {
+          res.status(502).json({ error: 'Emby compatibility playback is unavailable. Try the original stream.' });
+          return;
+        }
+        payload = setCached(itemCache, cacheKey, {
+          ...payload,
+          compatibility: false,
+          playSessionId: info.PlaySessionId || payload.playSessionId,
+          transcodingUrlPath,
+        }, 60_000);
+      }
+    }
     const playbackUrl = buildPlaybackUrlFromPayload(session, payload);
     const mode = getEmbyStreamProxyMode();
     const effectiveMode = payload.playMethod === 'Transcode' && mode === 'proxy' ? 'redirect' : mode;
@@ -1596,9 +1649,12 @@ async function handleSignedEmbyStreamRequest(req: any, res: any, loadConfigFromD
       return;
     }
 
-    startPlaybackProgressHeartbeat(session, payload, {
-      leaseMs: EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
-    });
+    if (req.method !== 'HEAD') {
+      void reportPlaybackStarted(session, payload);
+      startPlaybackProgressHeartbeat(session, payload, {
+        leaseMs: EMBY_REDIRECT_PLAYBACK_HEARTBEAT_MS,
+      });
+    }
     res.redirect(302, playbackUrl);
   } catch (error: any) {
     const message = error?.message || 'Invalid Emby playback request';
