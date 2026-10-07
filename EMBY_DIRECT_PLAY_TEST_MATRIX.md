@@ -70,3 +70,13 @@ EMBY_PLAYBACK_PROGRESS_INTERVAL_MS=30000
 - Stream JSON responses must be `no-store` and must not use ETags, so a new click does not reuse stale signed playback session data.
 - Proxy mode should preserve `Range`, `206 Partial Content`, `Content-Range`, `Accept-Ranges`, `Content-Length`, `Content-Type`, `ETag`, and `Last-Modified`.
 - Proxy mode should follow upstream Emby redirects without dropping the requested byte range.
+
+## Original playback and DTS compatibility
+
+The default Nuvio profile includes DTS for playback through the device/player decoder or a compatible audio receiver. `EMBY_DIRECT_PLAY_AUDIO_CODECS` still overrides the codec list for deployments that need a more restrictive profile.
+
+For DTS sources that Emby reports as direct-playable, the first choice is **Emby · Original**. The addon separately negotiates **Emby · Compatibility** using AAC output for devices without working DTS audio. This is a manual alternate stream, not automatic detection of a playback failure. If compatibility negotiation fails, the original remains available. Other unsupported sources continue to use Emby's negotiated conversion path.
+
+PlaybackInfo, signed playback URLs, and playback reports use `SubtitleStreamIndex=-1`. Nuvio handles subtitle selection and rendering; the addon no longer selects Emby's forced/default subtitle for server burn-in. Embedded subtitle tracks remain in the original file and the existing subtitle addons remain available.
+
+Validate the DTS movie on both Fire TV Stick Max and Google TV Streamer: select Original, confirm picture/audio/seeking and player-rendered subtitles, then verify Compatibility if original audio fails. Server negotiation and byte-range checks do not establish successful playback on physical devices.

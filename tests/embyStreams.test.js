@@ -146,12 +146,14 @@ test('getEmbyStreams calls PlaybackInfo and builds a Direct Play URL with MediaS
     assert.equal(postCalls[0].url.pathname, '/Items/item-1/PlaybackInfo');
     assert.equal(postCalls[0].body.IsPlayback, true);
     assert.equal(postCalls[0].body.EnableTranscoding, true);
+    assert.equal(postCalls[0].body.SubtitleStreamIndex, -1);
     assert.ok(postCalls[0].body.DeviceProfile);
 
     const stream = result.streams[0];
     const streamUrl = new URL(stream.url);
     assert.equal(streamUrl.pathname, '/Videos/item-1/stream.mkv');
     assert.equal(streamUrl.searchParams.get('static'), 'true');
+    assert.equal(streamUrl.searchParams.get('SubtitleStreamIndex'), '-1');
     assert.equal(streamUrl.searchParams.get('MediaSourceId'), 'media-source-1');
     assert.equal(streamUrl.searchParams.get('PlaySessionId'), 'play-session-1');
     assert.equal(streamUrl.searchParams.get('api_key'), 'token-abc');
@@ -1031,4 +1033,83 @@ test('proxy mode follows upstream redirects while preserving Range', async () =>
     assert.equal(res.statusCode, 206);
     assert.equal(res.headers['content-range'], 'bytes 0-1023/4096');
   });
+});
+
+test('DTS original comes first with a separate compatibility session and no forced subtitle burn-in', async () => {
+  await withEnv({ HOST_NAME: 'https://addon.example', EMBY_STREAM_PROXY_MODE: 'redirect', EMBY_STREAM_SIGNING_SECRET: 'test-secret', EMBY_DIRECT_PLAY_AUDIO_CODECS: undefined }, async () => {
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async () => ({ data: { Items: [{ Id: 'item-1' }] } }),
+      httpPost: async (url, body) => {
+        posts.push(body);
+        const compatibility = body.EnableDirectPlay === false;
+        const data = makePlaybackInfo({
+          SupportsDirectPlay: !compatibility,
+          SupportsTranscoding: true,
+          TranscodingUrl: compatibility ? '/videos/item-1/master.m3u8?AudioCodec=aac&SubtitleStreamIndex=4&api_key=token-abc' : undefined,
+          TranscodingSubProtocol: compatibility ? 'hls' : undefined,
+          MediaStreams: [
+            { Type: 'Video', Codec: 'h264', Index: 0 },
+            { Type: 'Audio', Codec: 'dts', Index: 1, IsDefault: true },
+            { Type: 'Subtitle', Codec: 'srt', Index: 4, IsForced: true },
+          ],
+        });
+        data.PlaySessionId = compatibility ? 'compat-session' : 'original-session';
+        return { data };
+      },
+    });
+    const session = { serverUrl: 'https://emby.example', accessToken: 'token-abc', userId: 'user-1', userUUID: 'addon-user-1' };
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      userUUID: session.userUUID,
+      apiKeys: { embyServer: session.serverUrl, embyUserId: session.userId, embyAccessToken: session.accessToken },
+    });
+    assert.equal(result.streams.length, 2);
+    assert.match(result.streams[0].name, /Original/);
+    assert.match(result.streams[1].name, /Compatibility/);
+    assert.match(posts[0].DeviceProfile.DirectPlayProfiles[0].AudioCodec, /\bdts\b/);
+    assert.doesNotMatch(posts[1].DeviceProfile.DirectPlayProfiles[0].AudioCodec, /\bdts\b/);
+    assert.equal(posts[1].MediaSourceId, 'media-source-1');
+    assert.equal(posts[1].AudioStreamIndex, 1);
+    assert.ok(posts.every(body => body.SubtitleStreamIndex === -1));
+    const payloads = result.streams.map(stream => emby.verifySignedEmbyStreamToken(new URL(stream.url).pathname.split('/')[3]));
+    assert.deepEqual(payloads.map(p => p.playMethod), ['DirectPlay', 'Transcode']);
+    assert.deepEqual(payloads.map(p => p.playSessionId), ['original-session', 'compat-session']);
+    assert.ok(payloads.every(p => p.subtitleStreamIndex === -1));
+    const original = new URL(emby.buildPlaybackUrlFromPayload(session, payloads[0]));
+    assert.equal(original.pathname, '/Videos/item-1/stream.mkv');
+    assert.equal(original.searchParams.get('static'), 'true');
+    const compatibility = new URL(emby.buildPlaybackUrlFromPayload(session, payloads[1]));
+    assert.equal(compatibility.searchParams.get('AudioCodec'), 'aac');
+    assert.equal(compatibility.searchParams.get('SubtitleStreamIndex'), '-1');
+  });
+});
+
+test('DTS original remains available when compatibility negotiation fails', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        if (new URL(url).pathname.endsWith('/PlaybackInfo')) throw new Error('upstream unavailable');
+        return { data: { Items: [{ Id: 'item-1' }] } };
+      },
+      httpPost: async (url, body) => {
+        if (!body.EnableDirectPlay) throw new Error('upstream unavailable');
+        return { data: makePlaybackInfo({ MediaStreams: [{ Type: 'Audio', Codec: 'dts', Index: 1 }] }) };
+      },
+    });
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'token-abc' },
+    });
+    assert.equal(result.streams.length, 1);
+    assert.equal(new URL(result.streams[0].url).searchParams.get('static'), 'true');
+  });
+});
+
+test('PlaybackInfo GET fallback also disables server-selected subtitles', async () => {
+  const calls = [];
+  const emby = loadEmbyStreamsWithMocks({
+    httpPost: async () => { throw new Error('POST unavailable'); },
+    httpGet: async (url) => { calls.push(new URL(url)); return { data: makePlaybackInfo() }; },
+  });
+  await emby.getPlaybackInfo({ serverUrl: 'https://emby.example', accessToken: 'token-abc', userId: 'user-1' }, 'item-1');
+  assert.equal(calls[0].searchParams.get('SubtitleStreamIndex'), '-1');
 });

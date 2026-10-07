@@ -466,11 +466,12 @@ async function getEmbyJson<T>(
   return setCached(itemCache, scopedCacheKey, data as T, EMBY_ITEM_CACHE_TTL_MS);
 }
 
-function buildNuvioDeviceProfile(): any {
-  const directPlayAudio = String(process.env.EMBY_DIRECT_PLAY_AUDIO_CODECS || 'aac,mp3,ac3,eac3,opus,flac')
+function buildNuvioDeviceProfile(allowDts = true): any {
+  const directPlayAudio = String(process.env.EMBY_DIRECT_PLAY_AUDIO_CODECS || 'aac,mp3,ac3,eac3,opus,flac,dts')
     .split(',')
     .map((codec) => codec.trim().toLowerCase())
     .filter(Boolean)
+    .filter((codec) => allowDts || codec !== 'dts')
     .join(',');
   return {
     Name: 'Nuvio Android TV',
@@ -528,7 +529,7 @@ function buildNuvioDeviceProfile(): any {
   };
 }
 
-async function getPlaybackInfo(session: EmbySession, itemId: string, options: Record<string, string | number | boolean | undefined> = {}): Promise<EmbyPlaybackInfo> {
+async function getPlaybackInfo(session: EmbySession, itemId: string, options: Record<string, string | number | boolean | undefined> = {}, deviceProfile = buildNuvioDeviceProfile()): Promise<EmbyPlaybackInfo> {
   const url = buildEmbyUrl(session.serverUrl, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
     UserId: session.userId,
     api_key: session.accessToken,
@@ -541,8 +542,10 @@ async function getPlaybackInfo(session: EmbySession, itemId: string, options: Re
     EnableDirectPlay: true,
     EnableDirectStream: true,
     EnableTranscoding: true,
+    // Nuvio selects and renders subtitles; do not burn Emby's preferred track into video.
+    SubtitleStreamIndex: -1,
     MaxStreamingBitrate: EMBY_MAX_STREAMING_BITRATE,
-    DeviceProfile: buildNuvioDeviceProfile(),
+    DeviceProfile: deviceProfile,
     ...options,
   };
 
@@ -572,6 +575,7 @@ async function getPlaybackInfo(session: EmbySession, itemId: string, options: Re
   const { data } = await httpGet(
     buildEmbyUrl(session.serverUrl, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
       UserId: session.userId,
+      SubtitleStreamIndex: -1,
       ...options,
       api_key: session.accessToken,
     }),
@@ -884,7 +888,7 @@ function buildTranscodingStreamUrl(session: EmbySession, payload: SignedStreamPa
   if (typeof payload.audioStreamIndex === 'number' && !parsed.searchParams.has('AudioStreamIndex')) {
     parsed.searchParams.set('AudioStreamIndex', String(payload.audioStreamIndex));
   }
-  if (typeof payload.subtitleStreamIndex === 'number' && !parsed.searchParams.has('SubtitleStreamIndex')) {
+  if (typeof payload.subtitleStreamIndex === 'number') {
     parsed.searchParams.set('SubtitleStreamIndex', String(payload.subtitleStreamIndex));
   }
   parsed.searchParams.set('api_key', session.accessToken);
@@ -1266,7 +1270,7 @@ function toEmbyStream(
   const videoSize = getMediaSize(item, mediaSource);
   const mediaStreams = getMediaStreams(item, mediaSource);
   const audioStreamIndex = selectStreamIndex(mediaStreams, 'Audio');
-  const subtitleStreamIndex = selectStreamIndex(mediaStreams, 'Subtitle');
+  const subtitleStreamIndex = -1;
   const streamIndexes = { audioStreamIndex, subtitleStreamIndex };
   const playbackPayload: SignedStreamPayload = {
     userUUID: session.userUUID || '',
@@ -1375,7 +1379,34 @@ async function toPlaybackAwareEmbyStream(session: EmbySession, item: EmbyItem): 
   if (directSource) {
     const mediaSourceId = directSource.Id || item.Id;
     const playSessionId = playbackInfo.PlaySessionId || generateFallbackPlaySessionId(session, item.Id, mediaSourceId);
-    return toEmbyStream(session, item, directSource, playSessionId, { playMethod: 'DirectPlay' });
+    const directStream = toEmbyStream(session, item, directSource, playSessionId, { playMethod: 'DirectPlay' });
+    const audioIndex = selectStreamIndex(getMediaStreams(item, directSource), 'Audio');
+    const audio = getMediaStreams(item, directSource).find((stream) => stream.Type?.toLowerCase() === 'audio' && stream.Index === audioIndex);
+    if (audio?.Codec?.toLowerCase() === 'dts') {
+      directStream.name = 'Emby · Original';
+      try {
+        const compatibilityInfo = await getPlaybackInfo(session, item.Id, {
+          MediaSourceId: mediaSourceId,
+          AudioStreamIndex: audioIndex,
+          EnableDirectPlay: false,
+        }, buildNuvioDeviceProfile(false));
+        const compatibilitySource = selectTranscodingSource(compatibilityInfo.MediaSources || []);
+        const compatibilityUrl = sanitizeTranscodingUrlPath(compatibilitySource?.TranscodingUrl);
+        if (compatibilitySource && compatibilityUrl) {
+          const compatibilitySessionId = compatibilityInfo.PlaySessionId || generateFallbackPlaySessionId(session, item.Id, compatibilitySource.Id || item.Id);
+          const compatibilityStream = toEmbyStream(session, item, compatibilitySource, compatibilitySessionId, {
+            playMethod: 'Transcode',
+            transcodingUrlPath: compatibilityUrl,
+          });
+          compatibilityStream.name = 'Emby · Compatibility';
+          compatibilityStream.description = `Use if the original has no sound.\n${compatibilityStream.description}`;
+          return [directStream, compatibilityStream];
+        }
+      } catch {
+        logger.warn(`[Emby] Compatibility stream unavailable for item ${item.Id}; keeping original playback`);
+      }
+    }
+    return directStream;
   }
 
   const transcodeSource = selectTranscodingSource(mediaSources);
@@ -1451,7 +1482,7 @@ async function getEmbyStreams(type: string, id: string, config: any): Promise<{ 
       ? await getEmbyMovieStream(session, id, config)
       : await getEmbySeriesStream(session, id, config);
 
-    return { streams: stream ? [stream] : [] };
+    return { streams: stream ? (Array.isArray(stream) ? stream : [stream]) : [] };
   } catch (error: any) {
     logger.warn(`[Emby] Stream lookup failed for ${type}/${id}: ${error.message}`);
     return { streams: [] };
