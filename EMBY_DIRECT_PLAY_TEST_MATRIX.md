@@ -105,6 +105,8 @@ To reproduce the deployed topology from the repository root, copy `deploy/nuvio.
 
 The release passed the frontend/backend builds, all 32 backend tests, the poster badge image tests, and native SQLite/bcrypt and CSV-import smoke checks. nginx and production Compose configuration validation also passed. The playback tests cover deferred compatibility negotiation, HEAD without playback side effects, byte-range proxy handling, disabled server subtitle selection, and rejection of tokens forged with the former predictable database-derived key.
 
+Release `8436162` was deployed and verified through the public hostname. Backend, nginx, and public health checks returned HTTP 200; all three containers were healthy with zero restarts. The movie stream list returned in 2.84 seconds with Original first and lazy Compatibility second. Original HEAD returned a private 302 in 0.24 seconds; Compatibility negotiated an AAC route in 2.05 seconds, and a repeated HEAD reused that session. Both redirects specified `SubtitleStreamIndex=-1`. A 128 KiB read at offset 7,123,244,980 returned HTTP 206 with the correct content range. Dedicated signing-key configuration, token redaction, and log rotation were verified in the running services. The production image's npm audit reported zero runtime advisories. These checks verify the server path; neither physical player was remotely inspected.
+
 ### Device findings and recommended baseline
 
 | Area | Fire TV Stick 4K Max | Google TV Streamer 4K |
