@@ -1,4 +1,5 @@
 const crypto: any = require('crypto');
+const languages: any = require('@cospired/i18n-iso-languages');
 const consola: any = require('consola');
 const { request: undiciRequest }: any = require('undici');
 const buildInfo: any = require('./buildInfo');
@@ -70,6 +71,8 @@ interface EmbySession {
 interface EmbyMediaStream {
   Type?: string;
   Codec?: string;
+  CodecTag?: string;
+  Language?: string;
   Index?: number;
   IsDefault?: boolean;
   IsForced?: boolean;
@@ -93,6 +96,7 @@ interface EmbyMediaSource {
   TranscodingContainer?: string;
   TranscodeReasons?: string | string[];
   MediaStreams?: EmbyMediaStream[];
+  DefaultAudioStreamIndex?: number;
 }
 
 interface EmbyPlaybackInfo {
@@ -769,15 +773,32 @@ function getMediaStreams(item: EmbyItem, mediaSource: EmbyMediaSource): EmbyMedi
   return mediaSource.MediaStreams || item.MediaStreams || [];
 }
 
-function selectStreamIndex(streams: EmbyMediaStream[], type: 'Audio' | 'Subtitle'): number | undefined {
-  const matching = streams.filter((stream) => String(stream.Type || '').toLowerCase() === type.toLowerCase());
-  if (matching.length === 0) {
-    return undefined;
-  }
+function hasKnownAudioCodec(stream: EmbyMediaStream | undefined): boolean {
+  const codec = String(stream?.Codec || '').trim().toLowerCase();
+  return Boolean(codec) && !['unknown', 'none', 'enca'].includes(codec)
+    && String(stream?.CodecTag || '').toLowerCase() !== 'enca';
+}
 
-  const selected = type === 'Subtitle'
-    ? matching.find((stream) => stream.IsDefault || stream.IsForced)
-    : matching.find((stream) => stream.IsDefault) || matching[0];
+function getDefaultAudioStream(streams: EmbyMediaStream[], defaultIndex?: number): EmbyMediaStream | undefined {
+  const audio = streams.filter((stream) => String(stream.Type || '').toLowerCase() === 'audio');
+  return audio.find((stream) => typeof defaultIndex === 'number' && stream.Index === defaultIndex)
+    || audio.find((stream) => stream.IsDefault) || audio[0];
+}
+
+function selectAudioStreamIndex(streams: EmbyMediaStream[], defaultIndex?: number, preferredLanguage?: string): number | undefined {
+  const defaultStream = getDefaultAudioStream(streams, defaultIndex);
+  const primaryLanguage = String(preferredLanguage || '').toLowerCase().split(/[-_]/)[0];
+  const preferredCodes = new Set([
+    primaryLanguage,
+    languages.alpha2ToAlpha3T(primaryLanguage),
+    languages.alpha2ToAlpha3B(primaryLanguage),
+  ].filter(Boolean));
+  const known = streams.filter((stream) => String(stream.Type || '').toLowerCase() === 'audio'
+    && typeof stream.Index === 'number' && hasKnownAudioCodec(stream));
+  const selected = hasKnownAudioCodec(defaultStream)
+    ? defaultStream
+    : known.find((stream) => preferredCodes.has(String(stream.Language || '').toLowerCase()))
+      || known[0] || defaultStream;
   return typeof selected?.Index === 'number' ? selected.Index : undefined;
 }
 
@@ -1268,7 +1289,7 @@ function toEmbyStream(
   const filename = getMediaSourceFilename(item, mediaSource);
   const videoSize = getMediaSize(item, mediaSource);
   const mediaStreams = getMediaStreams(item, mediaSource);
-  const audioStreamIndex = selectStreamIndex(mediaStreams, 'Audio');
+  const audioStreamIndex = selectAudioStreamIndex(mediaStreams, mediaSource.DefaultAudioStreamIndex);
   const subtitleStreamIndex = -1;
   const streamIndexes = { audioStreamIndex, subtitleStreamIndex };
   const playbackPayload: SignedStreamPayload = {
@@ -1367,12 +1388,21 @@ function toEmbyStream(
   };
 }
 
-async function toPlaybackAwareEmbyStream(session: EmbySession, item: EmbyItem): Promise<any | null> {
+async function toPlaybackAwareEmbyStream(session: EmbySession, item: EmbyItem, preferredLanguage?: string): Promise<any | null> {
   if (item.IsFolder || item.LocationType === 'Virtual') {
     return null;
   }
 
-  const playbackInfo = await getPlaybackInfo(session, item.Id);
+  const candidateSource = selectDirectPlayableSource(item);
+  const candidateStreams = getMediaStreams(item, candidateSource || {});
+  const defaultAudio = getDefaultAudioStream(candidateStreams, candidateSource?.DefaultAudioStreamIndex);
+  const fallbackAudioIndex = selectAudioStreamIndex(candidateStreams, candidateSource?.DefaultAudioStreamIndex, preferredLanguage);
+  const needsAudioFallback = defaultAudio && !hasKnownAudioCodec(defaultAudio)
+    && candidateStreams.some((stream) => stream.Index === fallbackAudioIndex && hasKnownAudioCodec(stream));
+  const playbackInfo = await getPlaybackInfo(session, item.Id, needsAudioFallback ? {
+    MediaSourceId: candidateSource?.Id,
+    AudioStreamIndex: fallbackAudioIndex,
+  } : {});
   const mediaSources = Array.isArray(playbackInfo.MediaSources) && playbackInfo.MediaSources.length > 0
     ? playbackInfo.MediaSources
     : item.MediaSources || [];
@@ -1381,7 +1411,7 @@ async function toPlaybackAwareEmbyStream(session: EmbySession, item: EmbyItem): 
     const mediaSourceId = directSource.Id || item.Id;
     const playSessionId = playbackInfo.PlaySessionId || generateFallbackPlaySessionId(session, item.Id, mediaSourceId);
     const directStream = toEmbyStream(session, item, directSource, playSessionId, { playMethod: 'DirectPlay' });
-    const audioIndex = selectStreamIndex(getMediaStreams(item, directSource), 'Audio');
+    const audioIndex = selectAudioStreamIndex(getMediaStreams(item, directSource), directSource.DefaultAudioStreamIndex);
     const audio = getMediaStreams(item, directSource).find((stream) => stream.Type?.toLowerCase() === 'audio' && stream.Index === audioIndex);
     if (audio?.Codec?.toLowerCase() === 'dts') {
       directStream.name = 'Emby · Original';
@@ -1451,7 +1481,7 @@ async function getEmbyMovieStream(session: EmbySession, id: string, config: any)
     return null;
   }
 
-  return toPlaybackAwareEmbyStream(session, movie);
+  return toPlaybackAwareEmbyStream(session, movie, config?.language);
 }
 
 async function getEmbySeriesStream(session: EmbySession, id: string, config: any): Promise<any | null> {
@@ -1480,7 +1510,7 @@ async function getEmbySeriesStream(session: EmbySession, id: string, config: any
     return null;
   }
 
-  return toPlaybackAwareEmbyStream(session, episode);
+  return toPlaybackAwareEmbyStream(session, episode, config?.language);
 }
 
 async function getEmbyStreams(type: string, id: string, config: any): Promise<{ streams: any[] }> {

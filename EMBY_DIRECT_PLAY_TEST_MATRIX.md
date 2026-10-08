@@ -135,3 +135,13 @@ No device-local settings or firmware were inspected or changed. The addon cannot
 - [Google audio output settings](https://support.google.com/chromecast/answer/10110321?hl=en)
 - [nginx upstream DNS resolution](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#resolve)
 - [Docker JSON log rotation](https://docs.docker.com/engine/logging/drivers/json-file/)
+
+## Lord of Mysteries episode 1 - 2026-10-07
+
+The reported Google TV request was `tt28618556:1:1`, Emby episode `6785592` (The Fool). Its file contains 1080p, 8-bit H.264 video and recognized EAC3 audio tracks in German, English, Spanish, and French. The default Portuguese track at index 5 has no identified codec and reports `CodecTag=enca`. No Chinese audio track is listed in this particular copy.
+
+With audio index 5, Emby rejected direct playback with `AudioCodecNotSupported`. Both HLS playlists returned HTTP 200, but the first actual media segment returned HTTP 500. With the same file and English audio index 2, Emby allowed direct play and direct stream. A 256 KiB original-file read returned HTTP 206 with the correct range in 1.09 seconds. This identifies a bad default audio selection and a failing upstream conversion, not a language-specific playback limitation.
+
+The addon now checks for an identified audio codec before inheriting an unusable file default. When a valid alternate track exists, it prefers the configured language for that fallback and negotiates the alternate before requesting playback. It also honors Emby's negotiated audio index when constructing the URL. Valid original-language defaults remain unchanged, and server subtitle burn-in remains disabled. No provider media files or device settings were modified.
+
+The frontend/backend builds and all 35 backend tests passed. A candidate built from the updated source was checked against the live provider and selected DirectPlay with English audio index 2 and subtitle index -1 for the exact episode. Tests also verify preservation of valid Chinese defaults and consistency with Emby's negotiated audio selection.

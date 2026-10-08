@@ -1172,3 +1172,80 @@ test('a known database path cannot be used to forge playback tokens', async () =
     assert.throws(() => emby.verifySignedEmbyStreamToken(`${body}.${signature}`), /signature/);
   });
 });
+
+test('an unreadable default audio track is replaced before episode playback negotiation', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+    const tracks = [
+      { Type: 'Video', Codec: 'h264', Index: 0 },
+      { Type: 'Audio', Codec: 'eac3', Language: 'ger', Index: 1 },
+      { Type: 'Audio', Codec: 'eac3', Language: 'eng', Index: 2 },
+      { Type: 'Audio', CodecTag: 'enca', Language: 'por', Index: 5, IsDefault: true },
+    ];
+    const source = { ...makePlaybackInfo().MediaSources[0], MediaStreams: tracks, DefaultAudioStreamIndex: 5 };
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async (url) => {
+        const pathname = new URL(url).pathname;
+        if (pathname === '/Users/user-1/Items') return { data: { Items: [{ Id: 'series-1' }] } };
+        if (pathname === '/Shows/series-1/Episodes') return { data: { Items: [{ Id: 'episode-1', ParentIndexNumber: 1, IndexNumber: 1, MediaSources: [source] }] } };
+        throw new Error(`Unexpected GET ${pathname}`);
+      },
+      httpPost: async (url, body) => {
+        posts.push(body);
+        assert.equal(new URL(url).pathname, '/Items/episode-1/PlaybackInfo');
+        return { data: makePlaybackInfo({ ...source, SupportsDirectPlay: body.AudioStreamIndex === 2, DefaultAudioStreamIndex: body.AudioStreamIndex }) };
+      },
+    });
+    const result = await emby.getEmbyStreams('series', 'tt1234567:1:1', {
+      language: 'en-US',
+      apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'token-abc' },
+    });
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].AudioStreamIndex, 2);
+    assert.equal(posts[0].MediaSourceId, 'media-source-1');
+    assert.equal(posts[0].SubtitleStreamIndex, -1);
+    assert.equal(result.streams.length, 1);
+    const url = new URL(result.streams[0].url);
+    assert.equal(url.searchParams.get('static'), 'true');
+    assert.equal(url.searchParams.get('AudioStreamIndex'), '2');
+    assert.match(result.streams[0].description, /Direct Play/);
+  });
+});
+
+test('a valid original-language default is retained despite a different catalog language', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+    const source = { ...makePlaybackInfo().MediaSources[0], DefaultAudioStreamIndex: 1, MediaStreams: [
+      { Type: 'Video', Codec: 'h264', Index: 0 },
+      { Type: 'Audio', Codec: 'aac', Language: 'zho', Index: 1, IsDefault: true },
+      { Type: 'Audio', Codec: 'eac3', Language: 'eng', Index: 2 },
+    ] };
+    const posts = [];
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async () => ({ data: { Items: [{ Id: 'item-1', MediaSources: [source] }] } }),
+      httpPost: async (url, body) => { posts.push(body); return { data: makePlaybackInfo(source) }; },
+    });
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      language: 'en-US', apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'token-abc' },
+    });
+    assert.equal(posts[0].AudioStreamIndex, undefined);
+    assert.equal(new URL(result.streams[0].url).searchParams.get('AudioStreamIndex'), '1');
+  });
+});
+
+test('an audio selection returned by Emby takes precedence over file default flags', async () => {
+  await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+    const source = { DefaultAudioStreamIndex: 2, MediaStreams: [
+      { Type: 'Video', Codec: 'h264', Index: 0 },
+      { Type: 'Audio', Codec: 'eac3', Language: 'ger', Index: 1, IsDefault: true },
+      { Type: 'Audio', Codec: 'eac3', Language: 'eng', Index: 2 },
+    ] };
+    const emby = loadEmbyStreamsWithMocks({
+      httpGet: async () => ({ data: { Items: [{ Id: 'item-1' }] } }),
+      httpPost: async () => ({ data: makePlaybackInfo(source) }),
+    });
+    const result = await emby.getEmbyStreams('movie', 'tt1234567', {
+      apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'token-abc' },
+    });
+    assert.equal(new URL(result.streams[0].url).searchParams.get('AudioStreamIndex'), '2');
+  });
+});
