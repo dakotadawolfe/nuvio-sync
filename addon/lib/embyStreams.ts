@@ -113,6 +113,7 @@ interface EmbyItem {
   SeriesId?: string;
   ParentIndexNumber?: number;
   IndexNumber?: number;
+  IndexNumberEnd?: number;
   MediaSources?: EmbyMediaSource[];
   MediaStreams?: EmbyMediaStream[];
   Size?: number;
@@ -1499,6 +1500,7 @@ async function getEmbySeriesStream(session: EmbySession, id: string, config: any
   }
 
   const matches = await findAllByImdbProviderId(session, 'series', imdbId);
+  const combinedEpisodes: EmbyItem[] = [];
   for (const series of matches) {
     let episodes: EmbyItem[];
     try {
@@ -1508,6 +1510,11 @@ async function getEmbySeriesStream(session: EmbySession, id: string, config: any
       continue;
     }
     for (const episode of episodes) {
+      if (episode.ParentIndexNumber === parsed.season &&
+          Number.isInteger(episode.IndexNumber) && Number.isInteger(episode.IndexNumberEnd) &&
+          episode.IndexNumber! < parsed.episode && episode.IndexNumberEnd! >= parsed.episode) {
+        combinedEpisodes.push(episode);
+      }
       if (episode.ParentIndexNumber !== parsed.season || episode.IndexNumber !== parsed.episode) continue;
       try {
         const stream = await toPlaybackAwareEmbyStream(session, episode, config?.language);
@@ -1515,6 +1522,16 @@ async function getEmbySeriesStream(session: EmbySession, id: string, config: any
       } catch {
         logger.warn(`[Emby] Playback unavailable for episode ${episode.Id}; checking remaining matches`);
       }
+    }
+  }
+  combinedEpisodes.sort((a, b) =>
+    (a.IndexNumberEnd! - a.IndexNumber!) - (b.IndexNumberEnd! - b.IndexNumber!));
+  for (const episode of combinedEpisodes) {
+    try {
+      const stream = await toPlaybackAwareEmbyStream(session, episode, config?.language);
+      if (stream) return stream;
+    } catch {
+      logger.warn(`[Emby] Playback unavailable for combined episode ${episode.Id}; checking remaining matches`);
     }
   }
   return null;

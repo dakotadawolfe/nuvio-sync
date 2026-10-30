@@ -1300,3 +1300,34 @@ for (const scenario of ['missing', 'virtual', 'unplayable', 'playback-error', 's
     });
   });
 }
+
+for (const scenario of ['range-end', 'range-middle', 'exact-preferred', 'narrowest-range', 'outside-range', 'wrong-season', 'invalid-range']) {
+  test(`combined episode lookup handles ${scenario}`, async () => {
+    await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+      let ranges = [{ Id: 'combined', ParentIndexNumber: 4, IndexNumber: 24, IndexNumberEnd: 26 }];
+      if (scenario === 'range-middle') ranges[0].IndexNumberEnd = 27;
+      if (scenario === 'outside-range') ranges[0].IndexNumberEnd = 25;
+      if (scenario === 'wrong-season') ranges[0].ParentIndexNumber = 5;
+      if (scenario === 'invalid-range') ranges[0].IndexNumberEnd = '26';
+      if (scenario === 'narrowest-range') ranges.unshift({ Id: 'wide', ParentIndexNumber: 4, IndexNumber: 23, IndexNumberEnd: 33 });
+      const emby = loadEmbyStreamsWithMocks({
+        httpGet: async (url) => {
+          const p = new URL(url).pathname;
+          if (p === '/Users/user-1/Items') return { data: { Items: [{ Id: 'first' }, { Id: 'second' }] } };
+          if (p === '/Shows/first/Episodes') return { data: { Items: ranges } };
+          if (p === '/Shows/second/Episodes') return { data: { Items: scenario === 'exact-preferred' ? [{ Id: 'exact', ParentIndexNumber: 4, IndexNumber: 26 }] : [] } };
+          throw new Error('Unexpected request');
+        },
+        httpPost: async () => ({ data: makePlaybackInfo() }),
+      });
+      const result = await emby.getEmbyStreams('series', 'tt0206512:4:26', {
+        apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'test-token' },
+      });
+      if (['outside-range', 'wrong-season', 'invalid-range'].includes(scenario)) assert.equal(result.streams.length, 0);
+      else {
+        assert.equal(result.streams.length, 1);
+        assert.equal(new URL(result.streams[0].url).pathname, `/Videos/${scenario === 'exact-preferred' ? 'exact' : 'combined'}/stream.mkv`);
+      }
+    });
+  });
+}
