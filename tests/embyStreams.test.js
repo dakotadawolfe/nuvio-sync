@@ -1249,3 +1249,54 @@ test('an audio selection returned by Emby takes precedence over file default fla
     assert.equal(new URL(result.streams[0].url).searchParams.get('AudioStreamIndex'), '2');
   });
 });
+
+for (const scenario of ['missing', 'virtual', 'unplayable', 'playback-error', 'series-error', 'same-series', 'special', 'absent', 'first-playable', 'movie']) {
+  test(`duplicate Emby lookup handles ${scenario}`, async () => {
+    await withEnv({ EMBY_STREAM_PROXY_MODE: 'off', HOST_NAME: undefined }, async () => {
+      const season = scenario === 'special' ? 0 : 17;
+      const episode = (Id, extra = {}) => ({ Id, ParentIndexNumber: season, IndexNumber: 20, ...extra });
+      const postCalls = [];
+      const seriesCalls = [];
+      const emby = loadEmbyStreamsWithMocks({
+        httpGet: async (url) => {
+          const parsed = new URL(url);
+          if (parsed.pathname === '/Users/user-1/Items') {
+            assert.equal(parsed.searchParams.has('Limit'), false);
+            assert.equal(parsed.searchParams.get('AnyProviderIdEquals'), 'imdb.tt0206512');
+            return { data: { Items: [{ Id: 'first' }, { Id: 'second' }] } };
+          }
+          if (parsed.pathname.endsWith('/PlaybackInfo')) throw new Error('Unavailable fallback');
+          seriesCalls.push(parsed.pathname);
+          if (parsed.pathname === '/Shows/first/Episodes') {
+            if (scenario === 'series-error') throw new Error('Unavailable series');
+            const items = scenario === 'same-series' ? [episode('bad', { LocationType: 'Virtual' }), episode('good')]
+              : ['missing', 'special', 'absent'].includes(scenario) ? [episode('wrong-season', { ParentIndexNumber: 18 }), episode('wrong-episode', { IndexNumber: 19 })]
+              : [episode('bad', scenario === 'virtual' ? { LocationType: 'Virtual' } : {})];
+            return { data: { Items: items } };
+          }
+          if (parsed.pathname === '/Shows/second/Episodes') {
+            return { data: { Items: scenario === 'absent' ? [] : [episode('good')] } };
+          }
+          throw new Error(`Unexpected GET ${parsed.pathname}`);
+        },
+        httpPost: async (url) => {
+          const pathname = new URL(url).pathname;
+          postCalls.push(pathname);
+          if (pathname === '/Items/first/PlaybackInfo' || (pathname === '/Items/bad/PlaybackInfo' && scenario === 'playback-error')) throw new Error('Unavailable item');
+          if (pathname === '/Items/bad/PlaybackInfo' && scenario === 'unplayable') return { data: { MediaSources: [] } };
+          return { data: makePlaybackInfo() };
+        },
+      });
+      const result = await emby.getEmbyStreams(scenario === 'movie' ? 'movie' : 'series', scenario === 'movie' ? 'tt0206512' : `tt0206512:${season}:20`, {
+        apiKeys: { embyServer: 'https://emby.example', embyUserId: 'user-1', embyAccessToken: 'test-token' },
+      });
+      assert.equal(result.streams.length, scenario === 'absent' ? 0 : 1);
+      if (scenario === 'absent') assert.deepEqual(postCalls, []);
+      else {
+        const expected = scenario === 'movie' ? 'second' : scenario === 'first-playable' ? 'bad' : 'good';
+        assert.equal(new URL(result.streams[0].url).pathname, `/Videos/${expected}/stream.mkv`);
+      }
+      if (['same-series', 'first-playable'].includes(scenario)) assert.equal(seriesCalls.length, 1);
+    });
+  });
+}

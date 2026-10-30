@@ -639,7 +639,7 @@ async function resolveImdbId(type: 'movie' | 'series', id: string, config: any):
   return resolvedIds?.imdbId || null;
 }
 
-async function findByImdbProviderId(session: EmbySession, type: 'movie' | 'series', imdbId: string): Promise<EmbyItem | null> {
+async function findAllByImdbProviderId(session: EmbySession, type: 'movie' | 'series', imdbId: string): Promise<EmbyItem[]> {
   const includeItemTypes = type === 'movie' ? 'Movie' : 'Series';
   const body = await getEmbyJson<{ Items?: EmbyItem[] }>(
     session,
@@ -648,13 +648,12 @@ async function findByImdbProviderId(session: EmbySession, type: 'movie' | 'serie
       IncludeItemTypes: includeItemTypes,
       Recursive: true,
       AnyProviderIdEquals: `imdb.${imdbId.toLowerCase()}`,
-      Limit: 1,
       Fields: DEFAULT_FIELDS,
     },
-    `find:${type}:${imdbId.toLowerCase()}`
+    `find-all:${type}:${imdbId.toLowerCase()}`
   );
 
-  return body?.Items?.[0] || null;
+  return body?.Items || [];
 }
 
 async function getSeriesEpisodes(session: EmbySession, seriesId: string): Promise<EmbyItem[]> {
@@ -1476,17 +1475,21 @@ async function getEmbyMovieStream(session: EmbySession, id: string, config: any)
     return null;
   }
 
-  const movie = await findByImdbProviderId(session, 'movie', imdbId);
-  if (!movie) {
-    return null;
+  const movies = await findAllByImdbProviderId(session, 'movie', imdbId);
+  for (const movie of movies) {
+    try {
+      const stream = await toPlaybackAwareEmbyStream(session, movie, config?.language);
+      if (stream) return stream;
+    } catch {
+      logger.warn(`[Emby] Playback unavailable for movie item ${movie.Id}; checking remaining matches`);
+    }
   }
-
-  return toPlaybackAwareEmbyStream(session, movie, config?.language);
+  return null;
 }
 
 async function getEmbySeriesStream(session: EmbySession, id: string, config: any): Promise<any | null> {
   const parsed = parseStreamId('series', id);
-  if (!parsed?.season || !parsed?.episode) {
+  if (parsed?.season === undefined || !parsed?.episode) {
     return null;
   }
 
@@ -1495,22 +1498,26 @@ async function getEmbySeriesStream(session: EmbySession, id: string, config: any
     return null;
   }
 
-  const series = await findByImdbProviderId(session, 'series', imdbId);
-  if (!series) {
-    return null;
+  const matches = await findAllByImdbProviderId(session, 'series', imdbId);
+  for (const series of matches) {
+    let episodes: EmbyItem[];
+    try {
+      episodes = await getSeriesEpisodes(session, series.Id);
+    } catch {
+      logger.warn(`[Emby] Episode lookup failed for series ${series.Id}; checking remaining matches`);
+      continue;
+    }
+    for (const episode of episodes) {
+      if (episode.ParentIndexNumber !== parsed.season || episode.IndexNumber !== parsed.episode) continue;
+      try {
+        const stream = await toPlaybackAwareEmbyStream(session, episode, config?.language);
+        if (stream) return stream;
+      } catch {
+        logger.warn(`[Emby] Playback unavailable for episode ${episode.Id}; checking remaining matches`);
+      }
+    }
   }
-
-  const episodes = await getSeriesEpisodes(session, series.Id);
-  const episode = episodes.find((candidate) =>
-    candidate.ParentIndexNumber === parsed.season &&
-    candidate.IndexNumber === parsed.episode
-  );
-
-  if (!episode) {
-    return null;
-  }
-
-  return toPlaybackAwareEmbyStream(session, episode, config?.language);
+  return null;
 }
 
 async function getEmbyStreams(type: string, id: string, config: any): Promise<{ streams: any[] }> {
